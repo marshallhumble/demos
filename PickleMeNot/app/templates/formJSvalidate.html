@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Input Form</title>
+  <script>
+    function validatePayload() {
+        const payload = document.forms[0].payload.value;
+        if (!payload || payload.length < 10) {
+            alert("Payload must be at least 10 characters.");
+            return false;
+        }
+        return true;
+    }
+  </script>
+</head>
+<body>
+<form action="/submit" method="post" onsubmit="return validatePayload()">
+  <label>Data input:</label><br>
+  <input type="text" name="payload" size="100"><br><br>
+  <input type="submit" value="Send">
+</form>
+</body>
+</html>
+

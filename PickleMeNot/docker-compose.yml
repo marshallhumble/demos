@@ -1,0 +1,20 @@
+services:
+  app:
+    container_name: secure_flask_app
+    build:
+      context: .
+      dockerfile: Dockerfile  # assumes this is in your root dir
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "1001:1001"
+    restart: unless-stopped
+
