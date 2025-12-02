@@ -14,13 +14,14 @@ jobs:
     name: Semgrep SAST
     runs-on: ubuntu-latest
     container:
-      image: returntocorp/semgrep
+      image: semgrep/semgrep
     steps:
       - uses: actions/checkout@v4
       
       - name: Run Semgrep
         run: |
           semgrep scan \
+            --config p/ci \
             --config p/csharp \
             --config p/dotnet \
             --config p/owasp-top-ten \
@@ -31,13 +32,16 @@ jobs:
             --config p/ruby \
             --config p/rust \
             --json \
-            --output=semgrep.json || true
+            --output=semgrep.json
+        continue-on-error: false
         
       - name: Process Results
+        if: always()
         run: |
           python3 << 'EOF'
           import json
           import os
+          import sys
           
           findings = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}
           details = []
@@ -46,20 +50,28 @@ jobs:
               with open('semgrep.json', 'r') as f:
                   data = json.load(f)
               
-              for result in data.get('results', []):
+              results = data.get('results', [])
+              print(f"Processing {len(results)} results")
+              
+              for result in results:
                   severity = result.get('extra', {}).get('severity', 'INFO').upper()
                   rule_id = result.get('check_id', 'unknown')
                   message = result.get('extra', {}).get('message', 'No description')
                   path = result.get('path', 'unknown')
                   line = result.get('start', {}).get('line', 0)
                   
+                  # Proper severity mapping for Semgrep
                   if severity == 'ERROR':
                       findings['high'] += 1
                       sev_label = 'high'
                   elif severity == 'WARNING':
                       findings['medium'] += 1
                       sev_label = 'medium'
+                  elif severity == 'INFO':
+                      findings['info'] += 1
+                      sev_label = 'info'
                   else:
+                      # Catch any unexpected severity levels
                       findings['low'] += 1
                       sev_label = 'low'
                   
@@ -69,20 +81,29 @@ jobs:
                       'message': message,
                       'location': f"{path}:{line}"
                   })
-          except:
-              pass
+              
+              print(f"Final counts: {findings}")
+              
+          except Exception as e:
+              print(f"ERROR: {e}")
+              import traceback
+              traceback.print_exc()
+              sys.exit(1)
           
           output = {
               'summary': findings,
-              'details': details[:10]  # Limit to top 10 for comment brevity
+              'details': details[:10]
           }
           
           with open('semgrep-summary.json', 'w') as f:
-              json.dump(output, f)
+              json.dump(output, f, indent=2)
+          
+          print("Summary written successfully")
           EOF
       
       - name: Upload summary
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: semgrep-summary
           path: semgrep-summary.json
@@ -138,9 +159,16 @@ jobs:
                   filepath = violation.get('filepath', 'unknown')
                   line = violation.get('line_no', 0)
                   
+                  # SQLFluff doesn't have real severity levels, categorize by rule type
+                  # Layout/style rules (L001-L099) are info level
                   if rule_code.startswith('L0'):
+                      findings['info'] += 1
+                      sev_label = 'info'
+                  # Convention rules (L1xx-L9xx) are low
+                  elif rule_code.startswith('L'):
                       findings['low'] += 1
                       sev_label = 'low'
+                  # Everything else (parsing errors, etc.) is medium
                   else:
                       findings['medium'] += 1
                       sev_label = 'medium'
@@ -220,20 +248,27 @@ jobs:
               with open('tsqllint-results.txt', 'r') as f:
                   lines = f.readlines()
               
-              # TSQLLint format: filepath(line,col) : error/warning code : message
-              pattern = r'(.+?)\((\d+),\d+\)\s*:\s*(error|warning)\s+(\S+)\s*:\s*(.+)'
+              # TSQLLint format: filepath(line,col) : error/warning/information code : message
+              pattern = r'(.+?)\((\d+),\d+\)\s*:\s*(error|warning|information)\s+(\S+)\s*:\s*(.+)'
               
               for line in lines:
                   match = re.match(pattern, line, re.IGNORECASE)
                   if match:
                       filepath, line_num, level, code, message = match.groups()
                       
-                      if level.lower() == 'error':
+                      level_lower = level.lower()
+                      if level_lower == 'error':
                           findings['high'] += 1
                           sev_label = 'high'
-                      else:
+                      elif level_lower == 'warning':
                           findings['medium'] += 1
                           sev_label = 'medium'
+                      elif level_lower == 'information':
+                          findings['info'] += 1
+                          sev_label = 'info'
+                      else:
+                          findings['low'] += 1
+                          sev_label = 'low'
                       
                       details.append({
                           'severity': sev_label,
@@ -303,7 +338,8 @@ jobs:
             $sevLabel = switch ($result.Severity) {
               'Error' { $findings.high++; 'high' }
               'Warning' { $findings.medium++; 'medium' }
-              'Information' { $findings.low++; 'low' }
+              'Information' { $findings.info++; 'info' }
+              default { $findings.low++; 'low' }
             }
             
             $details += @{
@@ -397,16 +433,18 @@ jobs:
                   file_line = result.get('file_line_range', [0])[0]
                   guideline = result.get('guideline', '')
                   
-                  # Checkov severity mapping
+                  # Checkov severity mapping with INFO support
                   severity_map = {
                       'CRITICAL': 'critical',
                       'HIGH': 'high',
                       'MEDIUM': 'medium',
-                      'LOW': 'low'
+                      'LOW': 'low',
+                      'INFO': 'info',
+                      'INFORMATIONAL': 'info'
                   }
                   
-                  # Checkov doesn't always provide severity, default to medium
-                  severity = severity_map.get(result.get('severity', 'MEDIUM'), 'medium')
+                  # Get severity or default to low
+                  severity = severity_map.get(result.get('severity', 'LOW').upper(), 'low')
                   findings[severity] += 1
                   
                   details.append({
@@ -479,8 +517,12 @@ jobs:
                   # Process vulnerabilities
                   for vuln in result.get('Vulnerabilities', []):
                       severity = vuln.get('Severity', '').lower()
-                      if severity in findings:
-                          findings[severity] += 1
+                      
+                      # Handle unknown severities
+                      if severity not in findings:
+                          severity = 'info'
+                      
+                      findings[severity] += 1
                       
                       vuln_id = vuln.get('VulnerabilityID', 'unknown')
                       pkg_name = vuln.get('PkgName', 'unknown')
@@ -500,8 +542,12 @@ jobs:
                   # Process misconfigurations
                   for misconfig in result.get('Misconfigurations', []):
                       severity = misconfig.get('Severity', '').lower()
-                      if severity in findings:
-                          findings[severity] += 1
+                      
+                      # Handle unknown severities
+                      if severity not in findings:
+                          severity = 'info'
+                      
+                      findings[severity] += 1
                       
                       rule_id = misconfig.get('ID', 'unknown')
                       title = misconfig.get('Title', 'No description')
