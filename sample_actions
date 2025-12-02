@@ -1,0 +1,224 @@
+name: Security Scanning
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+
+jobs:
+  semgrep:
+    name: Semgrep SAST
+    runs-on: ubuntu-latest
+    container:
+      image: returntocorp/semgrep
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run Semgrep
+        run: |
+          semgrep scan \
+            --config p/default \
+            --config p/owasp-top-ten \
+            --config p/security-audit \
+            --config p/csharp \
+            --config p/dotnet \
+            --config p/python \
+            --config p/bash \
+            --config p/ruby \
+            --config p/sql \
+            --config p/rust \
+            --config r/csharp.dotnet.security \
+            --config r/csharp.lang.security \
+            --json \
+            --output=semgrep.json || true
+        
+      - name: Process Results
+        run: |
+          python3 << 'EOF'
+          import json
+          import os
+          
+          findings = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}
+          
+          try:
+              with open('semgrep.json', 'r') as f:
+                  data = json.load(f)
+              
+              for result in data.get('results', []):
+                  severity = result.get('extra', {}).get('severity', 'INFO').upper()
+                  if severity == 'ERROR':
+                      findings['high'] += 1
+                  elif severity == 'WARNING':
+                      findings['medium'] += 1
+                  else:
+                      findings['low'] += 1
+          except:
+              pass
+          
+          with open('semgrep-summary.json', 'w') as f:
+              json.dump(findings, f)
+          EOF
+      
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-summary
+          path: semgrep-summary.json
+          retention-days: 1
+
+  trivy:
+    name: Trivy Container Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'json'
+          output: 'trivy-results.json'
+          scanners: 'vuln,secret,config'
+        continue-on-error: true
+      
+      - name: Process Results
+        run: |
+          python3 << 'EOF'
+          import json
+          
+          findings = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}
+          
+          try:
+              with open('trivy-results.json', 'r') as f:
+                  data = json.load(f)
+              
+              for result in data.get('Results', []):
+                  for vuln in result.get('Vulnerabilities', []):
+                      severity = vuln.get('Severity', '').lower()
+                      if severity in findings:
+                          findings[severity] += 1
+                  
+                  # Also check for misconfigurations
+                  for misconfig in result.get('Misconfigurations', []):
+                      severity = misconfig.get('Severity', '').lower()
+                      if severity in findings:
+                          findings[severity] += 1
+          except:
+              pass
+          
+          with open('trivy-summary.json', 'w') as f:
+              json.dump(findings, f)
+          EOF
+      
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-summary
+          path: trivy-summary.json
+          retention-days: 1
+
+  trufflehog:
+    name: TruffleHog Secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Run TruffleHog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          extra_args: --json --only-verified
+        continue-on-error: true
+      
+      - name: Process Results
+        run: |
+          python3 << 'EOF'
+          import json
+          
+          findings = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}
+          
+          with open('trufflehog-summary.json', 'w') as f:
+              json.dump(findings, f)
+          EOF
+      
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: trufflehog-summary
+          path: trufflehog-summary.json
+          retention-days: 1
+
+  report:
+    name: Post Results
+    runs-on: ubuntu-latest
+    needs: [semgrep, trivy, trufflehog]
+    if: always() && github.event_name == 'pull_request'
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+      
+      - name: Generate Report
+        run: |
+          python3 << 'EOF'
+          import json
+          
+          def load_results(filename):
+              try:
+                  with open(filename, 'r') as f:
+                      return json.load(f)
+              except:
+                  return {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}
+          
+          semgrep = load_results('semgrep-summary/semgrep-summary.json')
+          trivy = load_results('trivy-summary/trivy-summary.json')
+          trufflehog = load_results('trufflehog-summary/trufflehog-summary.json')
+          
+          def severity_badge(count, severity):
+              if count == 0:
+                  return f"![{severity}](https://img.shields.io/badge/{severity}-0-success)"
+              colors = {
+                  'critical': 'critical',
+                  'high': 'important',
+                  'medium': 'yellow',
+                  'low': 'blue',
+                  'info': 'lightgrey'
+              }
+              return f"![{severity}](https://img.shields.io/badge/{severity}-{count}-{colors[severity]})"
+          
+          report = "## Security Scan Results\n\n"
+          report += "| Tool | Critical | High | Medium | Low | Info |\n"
+          report += "|------|----------|------|--------|-----|------|\n"
+          
+          for name, data in [('Semgrep SAST', semgrep), ('Trivy SCA', trivy), ('TruffleHog Secrets', trufflehog)]:
+              report += f"| {name} | "
+              report += " | ".join([severity_badge(data[s], s) for s in ['critical', 'high', 'medium', 'low', 'info']])
+              report += " |\n"
+          
+          total = {s: semgrep[s] + trivy[s] + trufflehog[s] for s in ['critical', 'high', 'medium', 'low', 'info']}
+          report += f"| **Total** | "
+          report += " | ".join([severity_badge(total[s], s) for s in ['critical', 'high', 'medium', 'low', 'info']])
+          report += " |\n"
+          
+          with open('report.md', 'w') as f:
+              f.write(report)
+          EOF
+      
+      - name: Comment PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('report.md', 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: report
+            });
