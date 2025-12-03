@@ -31,19 +31,19 @@ jobs:
       - name: Restore dependencies
         run: dotnet restore
 
-      - name: Install Security Code Scan
-        run: dotnet tool install --global security-scan
+      - name: Install DevSkim
+        run: dotnet tool install --global Microsoft.CST.DevSkim.CLI
 
-      - name: Run Security Code Scan
+      - name: Run DevSkim
         run: |
-          dotnet security-scan --project . --export security-scan-results.sarif --sarif
+          devskim analyze . -f sarif -o devskim-results.sarif
         continue-on-error: true
 
-      - name: Upload Security Code Scan results
-        uses: github/codeql-action/upload-sarif@v3
+      - name: Upload DevSkim results
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
-          sarif_file: security-scan-results.sarif
+          sarif_file: devskim-results.sarif
           category: dotnet-security
 
   # Ruby on Rails Security Scanning
@@ -90,7 +90,7 @@ jobs:
           cache: 'pip'
 
       - name: Install Bandit
-        run: pip install bandit[toml]
+        run: pip install bandit[toml] --break-system-packages
 
       - name: Run Bandit
         run: |
@@ -161,7 +161,7 @@ jobs:
           cache: 'pip'
 
       - name: Install SQLFluff
-        run: pip install sqlfluff
+        run: pip install sqlfluff --break-system-packages
 
       - name: Run SQLFluff
         run: |
@@ -214,7 +214,7 @@ jobs:
         continue-on-error: true
 
       - name: Upload Trivy IaC results
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: trivy-iac-results.sarif
@@ -247,7 +247,7 @@ jobs:
         continue-on-error: true
 
       - name: Upload Trivy container results
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: trivy-container-results.sarif
@@ -270,7 +270,7 @@ jobs:
         continue-on-error: true
 
       - name: Upload Hadolint results
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: hadolint-results.sarif
@@ -318,7 +318,7 @@ jobs:
         continue-on-error: true
 
       - name: Upload Semgrep results
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: semgrep-results.sarif
