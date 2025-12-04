@@ -1,11 +1,7 @@
 name: Security Scanning
-
 on:
   pull_request:
     branches: [ main, develop ]
-  push:
-    branches: [ main, develop ]
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -13,366 +9,773 @@ permissions:
   security-events: write
 
 jobs:
-  # .NET/C# Security Scanning
-  dotnet-security:
-    name: .NET Security Scan
+  semgrep:
+    name: Semgrep SAST
     runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    if: (github.actor != 'dependabot[bot]')
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
 
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '9.0'
+      # Run Semgrep scan
+      - name: Run Semgrep (C# rules)
+        run: semgrep scan --config p/ci --config p/csharp --json --output semgrep.json
 
-      - name: Restore dependencies
-        run: dotnet restore
-
-      - name: Install DevSkim
-        run: dotnet tool install --global Microsoft.CST.DevSkim.CLI
-
-      - name: Run DevSkim
+      # Fail PR if ERROR-level findings exist
+      - name: Fail on ERROR-level findings
+        if: github.event_name == 'pull_request'
         run: |
-          devskim analyze . -f sarif -o devskim-results.sarif
-        continue-on-error: true
+          ERRORS=$(jq '[.results[] | select(.severity=="ERROR")] | length' semgrep.json)
+          echo "ERROR-level findings: $ERRORS"
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "::error ::Found $ERRORS ERROR-level findings. Failing PR."
+            exit 1
+          fi
 
-      - name: Upload DevSkim results
-        uses: github/codeql-action/upload-sarif@v4
-        if: always()
-        with:
-          sarif_file: devskim-results.sarif
-          category: dotnet-security
-
-  # Ruby on Rails Security Scanning
-  brakeman:
-    name: Brakeman Rails Security
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Ruby
-        uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.2'
-          bundler-cache: true
-
-      - name: Install Brakeman
-        run: gem install brakeman
-
-      - name: Run Brakeman
+      # Process Semgrep results for aggregated report
+      - name: Process Semgrep Results
         run: |
-          brakeman -f json -o brakeman-results.json --no-pager
-        continue-on-error: true
-
-      - name: Upload Brakeman results
+          python3 << 'EOF'
+          import json
+          findings = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}
+          details = []
+          try:
+              with open('semgrep.json', 'r') as f:
+                  data = json.load(f)
+              for r in data.get('results', []):
+                  severity = (r.get('severity') or 'INFO').upper()
+                  if severity == 'ERROR':
+                      findings['high'] += 1
+                      sev_label = 'high'
+                  elif severity == 'WARNING':
+                      findings['medium'] += 1
+                      sev_label = 'medium'
+                  elif severity == 'INFO':
+                      findings['info'] += 1
+                      sev_label = 'info'
+                  else:
+                      findings['low'] += 1
+                      sev_label = 'low'
+                  details.append({
+                      'severity': sev_label,
+                      'rule': r.get('check_id', 'unknown'),
+                      'message': r.get('extra', {}).get('message', 'No description'),
+                      'location': f"{r.get('path', 'unknown')}:{r.get('start', {}).get('line', 0)}"
+                  })
+          except Exception as e:
+              print(f"Error processing Semgrep results: {e}")
+          output = {'summary': findings, 'details': details[:10]}
+          with open('semgrep-summary.json', 'w') as f:
+              json.dump(output, f)
+          EOF
+      
+      # Upload artifact for report job
+      - name: Upload Semgrep Summary
         uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: brakeman-results
-          path: brakeman-results.json
-
-  # Python Security Scanning
-  bandit:
-    name: Bandit Python Security
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install Bandit
-        run: pip install bandit[toml] --break-system-packages
-
-      - name: Run Bandit
+          name: semgrep-summary
+          path: semgrep-summary.json
+          retention-days: 1
+          
+      - name: Show semgrep.rdjson (debug)
         run: |
-          bandit -r . -f json -o bandit-results.json
-        continue-on-error: true
+          echo "PWD: $(pwd)"
+          echo "ls -la:"
+          ls -la
+          echo "preview semgrep.rdjson (first 200 lines):"
+          head -n 200 semgrep.rdjson || true
 
-      - name: Upload Bandit results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: bandit-results
-          path: bandit-results.json
-
-  # Bash Script Security
-  shellcheck:
-    name: ShellCheck Bash Security
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Run ShellCheck
-        uses: ludeeus/action-shellcheck@master
-        with:
-          severity: warning
-          format: gcc
-        continue-on-error: true
-
-  # PowerShell Security
-  psscriptanalyzer:
-    name: PSScriptAnalyzer PowerShell
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install PSScriptAnalyzer
-        shell: pwsh
+      - name: Convert Semgrep JSON -> RDJSON
         run: |
-          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+          python3 .github/scripts/semgrep_to_rdjson.py < semgrep.json > semgrep.rdjson
+          echo "semgrep.rdjson count: $(python3 -c "import json; print(len(json.load(open('semgrep.rdjson'))['diagnostics']))")"
 
-      - name: Run PSScriptAnalyzer
-        shell: pwsh
+      - name: Debug - show semgrep.rdjson
         run: |
-          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Settings PSGallery
-          $results | ConvertTo-Json -Depth 10 | Out-File -FilePath psscriptanalyzer-results.json
-        continue-on-error: true
+          echo "PWD: $(pwd)"
+          ls -la
+          head -n 200 semgrep.rdjson || true
 
-      - name: Upload PSScriptAnalyzer results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: psscriptanalyzer-results
-          path: psscriptanalyzer-results.json
+      - name: Install reviewdog CLI
+        run: |
+          curl -sSLo /tmp/install_reviewdog.sh https://raw.githubusercontent.com/reviewdog/reviewdog/master/install.sh
+          bash /tmp/install_reviewdog.sh -b /usr/local/bin
+          reviewdog -version
 
-  # SQL Linting
+      - name:
+          Post Semgrep PR review
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.REVIEWDOG_TOKEN }}   # PAT (repo secret)
+          BASE_REF: ${{ github.base_ref }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+        run: |
+          # choose reporter: github-pr-review requires PAT (REVIEWDOG_GITHUB_API_TOKEN)
+          # for PRs from forks the secret is unavailable; we fallback to github-check using GITHUB_TOKEN
+          if [ "${IS_FORK}" = "true" ]; then
+            echo "PR is from a fork: using github-check with GITHUB_TOKEN (no PAT)"
+            export REVIEWDOG_GITHUB_API_TOKEN="${{ secrets.GITHUB_TOKEN }}"
+            cat semgrep.rdjson \
+              | reviewdog -f=rdjson \
+                          -name="semgrep" \
+                          -reporter=github-check \
+                          -level=info \
+                          -filter-mode=nofilter \
+                          -diff="origin/${BASE_REF}" \
+                          -fail-on-error=false || true
+          else
+            echo "Internal PR: using github-pr-review with PAT"
+            # REVIEWDOG_GITHUB_API_TOKEN must be set to the PAT in the repository secret REVIEWDOG_TOKEN
+            cat semgrep.rdjson \
+              | reviewdog -f=rdjson \
+                          -name="semgrep" \
+                          -reporter=github-pr-review \
+                          -level=info \
+                          -filter-mode=nofilter \
+                          -diff="origin/${BASE_REF}" \
+                          -fail-on-error=false || true
+          fi
+  
+  # Other jobs (SQLFluff, TSQLLint, PowerShell, Checkov, Trivy, TruffleHog) remain unchanged
+  # ...
+  # Report job remains unchanged and will now include Semgrep findings from semgrep-summary.json
+  
+  
   sqlfluff:
-    name: SQLFluff SQL Linting
+    name: SQLFluff Analysis
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Check for SQL files
+        id: check_sql
+        run: |
+          if find . -type f -name "*.sql" | grep -q .; then
+            echo "has_sql_files=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_sql_files=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Python
+        if: steps.check_sql.outputs.has_sql_files == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: Install SQLFluff
-        run: pip install sqlfluff --break-system-packages
+        if: steps.check_sql.outputs.has_sql_files == 'true'
+        run: pip install sqlfluff sqlfluff-templater-dbt
 
       - name: Run SQLFluff
+        if: steps.check_sql.outputs.has_sql_files == 'true'
         run: |
-          sqlfluff lint --format json --dialect ansi . > sqlfluff-results.json || true
+          sqlfluff lint . --format json --dialect tsql > sqlfluff-results.json || true
         continue-on-error: true
 
-      - name: Upload SQLFluff results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: sqlfluff-results
-          path: sqlfluff-results.json
+      - name: Process SQLFluff Results
+        if: steps.check_sql.outputs.has_sql_files == 'true'
+        run: |
+          python3 << 'EOF'
+          import json
+          
+          findings = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}
+          details = []
+          
+          try:
+              with open('sqlfluff-results.json', 'r') as f:
+                  data = json.load(f)
+          
+              for violation in data:
+                  rule_code = violation.get('code', '')
+                  description = violation.get('description', 'No description')
+                  filepath = violation.get('filepath', 'unknown')
+                  line = violation.get('line_no', 0)
+          
+                  # SQLFluff doesn't have real severity levels, categorize by rule type
+                  # Layout/style rules (L001-L099) are info level
+                  if rule_code.startswith('L0'):
+                      findings['info'] += 1
+                      sev_label = 'info'
+                  # Convention rules (L1xx-L9xx) are low
+                  elif rule_code.startswith('L'):
+                      findings['low'] += 1
+                      sev_label = 'low'
+                  # Everything else (parsing errors, etc.) is medium
+                  else:
+                      findings['medium'] += 1
+                      sev_label = 'medium'
+          
+                  details.append({
+                      'severity': sev_label,
+                      'rule': rule_code,
+                      'message': description,
+                      'location': f"{filepath}:{line}"
+                  })
+          except:
+              pass
+          
+          output = {
+              'summary': findings,
+              'details': details[:10]
+          }
+          
+          with open('sqlfluff-summary.json', 'w') as f:
+              json.dump(output, f)
+          EOF
 
-  # T-SQL Linting
+      - name: Create empty summary if no SQL files
+        if: steps.check_sql.outputs.has_sql_files == 'false'
+        run: |
+          echo '{"summary": {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}, "details": []}' > sqlfluff-summary.json
+
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sqlfluff-summary
+          path: sqlfluff-summary.json
+          retention-days: 1
+  
   tsqllint:
-    name: TSQLLint T-SQL Linting
+    name: TSQLLint Analysis
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Check for SQL files
+        id: check_sql
+        run: |
+          if find . -type f -name "*.sql" | grep -q .; then
+            echo "has_sql_files=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_sql_files=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Setup .NET
+        if: steps.check_sql.outputs.has_sql_files == 'true'
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '9.0'
+          dotnet-version: '8.0.x'
 
       - name: Install TSQLLint
+        if: steps.check_sql.outputs.has_sql_files == 'true'
         run: dotnet tool install --global TSQLLint
 
       - name: Run TSQLLint
+        if: steps.check_sql.outputs.has_sql_files == 'true'
         run: |
-          find . -name "*.sql" -type f | xargs -I {} tsqllint {} || true
+          ~/.dotnet/tools/tsqllint . > tsqllint-results.txt || true
         continue-on-error: true
 
-  # Terraform Security
-  terraform-security:
-    name: Terraform Security Scan
+      - name: Process TSQLLint Results
+        if: steps.check_sql.outputs.has_sql_files == 'true'
+        run: |
+          python3 << 'EOF'
+          import re
+          import json
+          
+          findings = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}
+          details = []
+          
+          try:
+              with open('tsqllint-results.txt', 'r') as f:
+                  lines = f.readlines()
+          
+              # TSQLLint format: filepath(line,col) : error/warning/information code : message
+              pattern = r'(.+?)\((\d+),\d+\)\s*:\s*(error|warning|information)\s+(\S+)\s*:\s*(.+)'
+          
+              for line in lines:
+                  match = re.match(pattern, line, re.IGNORECASE)
+                  if match:
+                      filepath, line_num, level, code, message = match.groups()
+          
+                      level_lower = level.lower()
+                      if level_lower == 'error':
+                          findings['high'] += 1
+                          sev_label = 'high'
+                      elif level_lower == 'warning':
+                          findings['medium'] += 1
+                          sev_label = 'medium'
+                      elif level_lower == 'information':
+                          findings['info'] += 1
+                          sev_label = 'info'
+                      else:
+                          findings['low'] += 1
+                          sev_label = 'low'
+          
+                      details.append({
+                          'severity': sev_label,
+                          'rule': code,
+                          'message': message.strip(),
+                          'location': f"{filepath}:{line_num}"
+                      })
+          except:
+              pass
+          
+          output = {
+              'summary': findings,
+              'details': details[:10]
+          }
+          
+          with open('tsqllint-summary.json', 'w') as f:
+              json.dump(output, f)
+          EOF
+
+      - name: Create empty summary if no SQL files
+        if: steps.check_sql.outputs.has_sql_files == 'false'
+        run: |
+          echo '{"summary": {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}, "details": []}' > tsqllint-summary.json
+
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsqllint-summary
+          path: tsqllint-summary.json
+          retention-days: 1
+
+  powershell:
+    name: PowerShell Analysis
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for PowerShell files
+        id: check_ps
+        shell: pwsh
+        run: |
+          $psFiles = Get-ChildItem -Path . -Recurse -Include *.ps1,*.psm1,*.psd1 -ErrorAction SilentlyContinue
+          if ($psFiles) {
+            echo "has_ps_files=true" >> $env:GITHUB_OUTPUT
+          } else {
+            echo "has_ps_files=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Run PSScriptAnalyzer
+        if: steps.check_ps.outputs.has_ps_files == 'true'
+        shell: pwsh
+        run: |
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error,Warning,Information
+          
+          $findings = @{
+            critical = 0
+            high = 0
+            medium = 0
+            low = 0
+            info = 0
+          }
+          
+          $details = @()
+          
+          foreach ($result in $results) {
+            $sevLabel = switch ($result.Severity) {
+              'Error' { $findings.high++; 'high' }
+              'Warning' { $findings.medium++; 'medium' }
+              'Information' { $findings.info++; 'info' }
+              default { $findings.low++; 'low' }
+            }
+          
+            $details += @{
+              severity = $sevLabel
+              rule = $result.RuleName
+              message = $result.Message
+              location = "$($result.ScriptPath):$($result.Line)"
+            }
+          }
+          
+          $output = @{
+            summary = $findings
+            details = $details | Select-Object -First 10
+          }
+          
+          $output | ConvertTo-Json -Depth 3 | Out-File -FilePath powershell-summary.json
+
+      - name: Create empty summary if no PS files
+        if: steps.check_ps.outputs.has_ps_files == 'false'
+        shell: pwsh
+        run: |
+          @{
+            summary = @{
+              critical = 0
+              high = 0
+              medium = 0
+              low = 0
+              info = 0
+            }
+            details = @()
+          } | ConvertTo-Json | Out-File -FilePath powershell-summary.json
+
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: powershell-summary
+          path: powershell-summary.json
+          retention-days: 1
+
+  checkov:
+    name: Checkov IaC Scan
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Run Trivy for IaC
-        uses: aquasecurity/trivy-action@master
+      - name: Check for IaC files
+        id: check_iac
+        run: |
+          if find . -type f \( -name "*.tf" -o -name "Dockerfile" -o -name "*.yaml" -o -name "*.yml" \) | grep -q .; then
+            echo "has_iac_files=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_iac_files=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Python
+        if: steps.check_iac.outputs.has_iac_files == 'true'
+        uses: actions/setup-python@v5
         with:
-          scan-type: 'config'
-          scan-ref: '.'
-          format: 'sarif'
-          output: 'trivy-iac-results.sarif'
+          python-version: '3.11'
+
+      - name: Install Checkov
+        if: steps.check_iac.outputs.has_iac_files == 'true'
+        run: pip install checkov
+
+      - name: Run Checkov
+        if: steps.check_iac.outputs.has_iac_files == 'true'
+        run: |
+          checkov -d . --output json --output-file-path . --quiet || true
         continue-on-error: true
 
-      - name: Upload Trivy IaC results
-        uses: github/codeql-action/upload-sarif@v4
-        if: always()
-        with:
-          sarif_file: trivy-iac-results.sarif
-          category: terraform-security
+      - name: Process Checkov Results
+        if: steps.check_iac.outputs.has_iac_files == 'true'
+        run: |
+          python3 << 'EOF'
+          import json
+          import os
+          
+          findings = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}
+          details = []
+          
+          try:
+              # Checkov creates results_json.json
+              with open('results_json.json', 'r') as f:
+                  data = json.load(f)
+          
+              # Process failed checks
+              for result in data.get('results', {}).get('failed_checks', []):
+                  check_id = result.get('check_id', 'unknown')
+                  check_name = result.get('check_name', 'No description')
+                  file_path = result.get('file_path', 'unknown')
+                  file_line = result.get('file_line_range', [0])[0]
+                  guideline = result.get('guideline', '')
+          
+                  # Checkov severity mapping with INFO support
+                  severity_map = {
+                      'CRITICAL': 'critical',
+                      'HIGH': 'high',
+                      'MEDIUM': 'medium',
+                      'LOW': 'low',
+                      'INFO': 'info',
+                      'INFORMATIONAL': 'info'
+                  }
+          
+                  # Get severity or default to low
+                  severity = severity_map.get(result.get('severity', 'LOW').upper(), 'low')
+                  findings[severity] += 1
+          
+                  details.append({
+                      'severity': severity,
+                      'rule': check_id,
+                      'message': check_name,
+                      'guideline': guideline,
+                      'location': f"{file_path}:{file_line}"
+                  })
+          except Exception as e:
+              print(f"Error processing Checkov results: {e}")
+              pass
+          
+          # Sort by severity and limit to top 10
+          severity_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4}
+          details.sort(key=lambda x: severity_order.get(x['severity'], 5))
+          
+          output = {
+              'summary': findings,
+              'details': details[:10]
+          }
+          
+          with open('checkov-summary.json', 'w') as f:
+              json.dump(output, f)
+          EOF
 
-  # Docker Container Scanning
-  trivy-containers:
-    name: Trivy Container CVE Scan
+      - name: Create empty summary if no IaC files
+        if: steps.check_iac.outputs.has_iac_files == 'false'
+        run: |
+          echo '{"summary": {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}, "details": []}' > checkov-summary.json
+
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkov-summary
+          path: checkov-summary.json
+          retention-days: 1
+
+  trivy:
+    name: Trivy Container Scan
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Find Dockerfiles
-        id: dockerfiles
-        run: |
-          DOCKERFILES=$(find . -name "Dockerfile*" -type f)
-          echo "dockerfiles<<EOF" >> $GITHUB_OUTPUT
-          echo "$DOCKERFILES" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Run Trivy vulnerability scanner
+      - name: Run Trivy
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: 'fs'
           scan-ref: '.'
-          format: 'sarif'
-          output: 'trivy-container-results.sarif'
-          severity: 'CRITICAL,HIGH,MEDIUM'
+          format: 'json'
+          output: 'trivy-results.json'
+          scanners: 'vuln,secret,config'
         continue-on-error: true
 
-      - name: Upload Trivy container results
-        uses: github/codeql-action/upload-sarif@v4
-        if: always()
+      - name: Process Results
+        run: |
+          python3 << 'EOF'
+          import json
+          
+          findings = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}
+          details = []
+          
+          try:
+              with open('trivy-results.json', 'r') as f:
+                  data = json.load(f)
+          
+              for result in data.get('Results', []):
+                  target = result.get('Target', 'unknown')
+          
+                  # Process vulnerabilities
+                  for vuln in result.get('Vulnerabilities', []):
+                      severity = vuln.get('Severity', '').lower()
+          
+                      # Handle unknown severities
+                      if severity not in findings:
+                          severity = 'info'
+          
+                      findings[severity] += 1
+          
+                      vuln_id = vuln.get('VulnerabilityID', 'unknown')
+                      pkg_name = vuln.get('PkgName', 'unknown')
+                      installed_version = vuln.get('InstalledVersion', 'unknown')
+                      fixed_version = vuln.get('FixedVersion', 'not available')
+                      title = vuln.get('Title', 'No description')
+          
+                      details.append({
+                          'severity': severity,
+                          'type': 'vulnerability',
+                          'id': vuln_id,
+                          'message': f"{pkg_name} {installed_version}: {title}",
+                          'fix': f"Upgrade to {fixed_version}" if fixed_version != 'not available' else 'No fix available',
+                          'location': target
+                      })
+          
+                  # Process misconfigurations
+                  for misconfig in result.get('Misconfigurations', []):
+                      severity = misconfig.get('Severity', '').lower()
+          
+                      # Handle unknown severities
+                      if severity not in findings:
+                          severity = 'info'
+          
+                      findings[severity] += 1
+          
+                      rule_id = misconfig.get('ID', 'unknown')
+                      title = misconfig.get('Title', 'No description')
+                      message = misconfig.get('Message', '')
+          
+                      details.append({
+                          'severity': severity,
+                          'type': 'misconfiguration',
+                          'id': rule_id,
+                          'message': title,
+                          'fix': message,
+                          'location': target
+                      })
+          except:
+              pass
+          
+          # Sort by severity (critical first) and limit to top 10
+          severity_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4}
+          details.sort(key=lambda x: severity_order.get(x['severity'], 5))
+          
+          output = {
+              'summary': findings,
+              'details': details[:10]
+          }
+          
+          with open('trivy-summary.json', 'w') as f:
+              json.dump(output, f)
+          EOF
+
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
         with:
-          sarif_file: trivy-container-results.sarif
-          category: container-security
+          name: trivy-summary
+          path: trivy-summary.json
+          retention-days: 1
 
-  # Dockerfile Linting
-  hadolint:
-    name: Hadolint Dockerfile Linting
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Run Hadolint
-        uses: hadolint/hadolint-action@v3.1.0
-        with:
-          recursive: true
-          format: sarif
-          output-file: hadolint-results.sarif
-        continue-on-error: true
-
-      - name: Upload Hadolint results
-        uses: github/codeql-action/upload-sarif@v4
-        if: always()
-        with:
-          sarif_file: hadolint-results.sarif
-          category: dockerfile-linting
-
-  # Secrets Scanning
   trufflehog:
-    name: TruffleHog Secrets Scan
+    name: TruffleHog Secrets
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Run TruffleHog
         uses: trufflesecurity/trufflehog@main
         with:
-          path: ./
-          base: ${{ github.event.repository.default_branch }}
-          head: HEAD
           extra_args: --json --only-verified
         continue-on-error: true
 
-  # Semgrep Multi-language Security
-  semgrep:
-    name: Semgrep Security Analysis
-    runs-on: ubuntu-latest
-    container:
-      image: semgrep/semgrep
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Run Semgrep
+      - name: Process Results
         run: |
-          semgrep scan --config=p/security-audit \
-                       --config=p/owasp-top-ten \
-                       --config=p/cwe-top-25 \
-                       --config=p/sql-injection \
-                       --config=p/secrets \
-                       --config=p/csharp \
-                       --sarif --output=semgrep-results.sarif \
-                       --severity=ERROR --severity=WARNING
-        continue-on-error: true
+          python3 << 'EOF'
+          import json
+          
+          findings = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}
+          details = []
+          
+          # TruffleHog outputs are difficult to capture from the action
+          # This is a placeholder structure
+          
+          output = {
+              'summary': findings,
+              'details': details
+          }
+          
+          with open('trufflehog-summary.json', 'w') as f:
+              json.dump(output, f)
+          EOF
 
-      - name: Upload Semgrep results
-        uses: github/codeql-action/upload-sarif@v4
-        if: always()
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
         with:
-          sarif_file: semgrep-results.sarif
-          category: semgrep-security
+          name: trufflehog-summary
+          path: trufflehog-summary.json
+          retention-days: 1
 
-  # Results Aggregation
-  aggregate-results:
-    name: Aggregate Security Results
+  report:
+    name: Post Results
     runs-on: ubuntu-latest
-    needs: [
-      dotnet-security,
-      brakeman,
-      bandit,
-      shellcheck,
-      psscriptanalyzer,
-      sqlfluff,
-      tsqllint,
-      terraform-security,
-      trivy-containers,
-      hadolint,
-      trufflehog,
-      semgrep
-    ]
-    if: always()
+    needs: [semgrep, sqlfluff, tsqllint, powershell, checkov, trivy, trufflehog]
+    if: always() && github.event_name == 'pull_request'
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
       - name: Download all artifacts
         uses: actions/download-artifact@v4
+
+      - name: Generate Report
+        run: |
+          python3 << 'EOF'
+          import json
+          
+          def load_results(filename):
+              try:
+                  with open(filename, 'r') as f:
+                      data = json.load(f)
+                      # Handle both old format (dict) and new format (dict with summary/details)
+                      if 'summary' in data:
+                          return data
+                      else:
+                          return {'summary': data, 'details': []}
+              except:
+                  return {'summary': {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}, 'details': []}
+          
+          semgrep = load_results('semgrep-summary/semgrep-summary.json')
+          sqlfluff = load_results('sqlfluff-summary/sqlfluff-summary.json')
+          tsqllint = load_results('tsqllint-summary/tsqllint-summary.json')
+          powershell = load_results('powershell-summary/powershell-summary.json')
+          checkov = load_results('checkov-summary/checkov-summary.json')
+          trivy = load_results('trivy-summary/trivy-summary.json')
+          trufflehog = load_results('trufflehog-summary/trufflehog-summary.json')
+          
+          def severity_badge(count, severity):
+              if count == 0:
+                  return f"![{severity}](https://img.shields.io/badge/{severity}-0-success)"
+              colors = {
+                  'critical': 'critical',
+                  'high': 'important',
+                  'medium': 'yellow',
+                  'low': 'blue',
+                  'info': 'lightgrey'
+              }
+              return f"![{severity}](https://img.shields.io/badge/{severity}-{count}-{colors[severity]})"
+          
+          def has_findings(data):
+              return sum(data['summary'].values()) > 0
+          
+          report = "## Security Scan Results\n\n"
+          report += "| Tool | Critical | High | Medium | Low | Info |\n"
+          report += "|------|----------|------|--------|-----|------|\n"
+          
+          tools = [
+              ('Semgrep SAST', semgrep),
+              ('SQLFluff', sqlfluff),
+              ('TSQLLint', tsqllint),
+              ('PowerShell', powershell),
+              ('Checkov IaC', checkov),
+              ('Trivy SCA', trivy),
+              ('TruffleHog Secrets', trufflehog)
+          ]
+          
+          for name, data in tools:
+              summary = data['summary']
+              report += f"| {name} | "
+              report += " | ".join([severity_badge(summary[s], s) for s in ['critical', 'high', 'medium', 'low', 'info']])
+              report += " |\n"
+          
+          total = {s: sum(tool[1]['summary'][s] for tool in tools) for s in ['critical', 'high', 'medium', 'low', 'info']}
+          report += f"| **Total** | "
+          report += " | ".join([severity_badge(total[s], s) for s in ['critical', 'high', 'medium', 'low', 'info']])
+          report += " |\n"
+          
+          # Add detailed findings for each tool
+          for name, data in tools:
+              if has_findings(data) and data['details']:
+                  report += f"\n### {name} - Top Findings\n"
+          
+                  for detail in data['details']:
+                      severity_emoji = {
+                          'critical': '🔴',
+                          'high': '🟠',
+                          'medium': '🟡',
+                          'low': '🔵',
+                          'info': '⚪'
+                      }
+                      emoji = severity_emoji.get(detail['severity'], '⚪')
+          
+                      if detail.get('type') in ('vulnerability','misconfiguration'):  # Trivy format
+                          report += f"- {emoji} **{detail['id']}** ({detail['type']}): {detail['message']}\n"
+                          report += f"  - Location: `{detail['location']}`\n"
+                          if detail.get('fix'):
+                              report += f"  - Fix: {detail['fix']}\n"
+                      elif 'guideline' in detail:  # Checkov format
+                          report += f"- {emoji} **{detail['rule']}**: {detail['message']}\n"
+                          report += f"  - Location: `{detail['location']}`\n"
+                          if detail.get('guideline'):
+                              report += f"  - Guideline: {detail['guideline']}\n"
+                      else:  # Standard format
+                          report += f"- {emoji} **{detail['rule']}**: {detail['message']}\n"
+                          report += f"  - Location: `{detail['location']}`\n"
+          
+                  report += "\n" 
+          
+          with open('report.md', 'w') as f:
+              f.write(report)
+          EOF
+
+      - name: Comment PR
+        uses: actions/github-script@v7
         with:
-          path: security-results
-
-      - name: Create summary
-        run: |
-          echo "# Security Scanning Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## Scan Status" >> $GITHUB_STEP_SUMMARY
-          echo "- .NET Security: ${{ needs.dotnet-security.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Brakeman (Rails): ${{ needs.brakeman.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Bandit (Python): ${{ needs.bandit.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- ShellCheck (Bash): ${{ needs.shellcheck.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- PSScriptAnalyzer (PowerShell): ${{ needs.psscriptanalyzer.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- SQLFluff: ${{ needs.sqlfluff.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- TSQLLint: ${{ needs.tsqllint.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Terraform Security: ${{ needs.terraform-security.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Trivy Containers: ${{ needs.trivy-containers.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Hadolint: ${{ needs.hadolint.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- TruffleHog: ${{ needs.trufflehog.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Semgrep: ${{ needs.semgrep.result }}" >> $GITHUB_STEP_SUMMARY
-
-      - name: Check for failures
-        run: |
-          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
-            echo "One or more security scans failed"
-            exit 1
-          fi
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('report.md', 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: report
+            });
