@@ -7,6 +7,7 @@ permissions:
   contents: read
   pull-requests: write
   security-events: write
+  checks: write
 
 jobs:
   semgrep:
@@ -14,12 +15,11 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: semgrep/semgrep
-    if: (github.actor != 'dependabot[bot]')
+    if: github.actor != 'dependabot[bot]'
     steps:
       - uses: actions/checkout@v4
 
-      # Run Semgrep scan
-      - name: Run Semgrep (C# rules)
+      - name: Run Semgrep
         run: |
           semgrep scan \
             --config=p/golang \
@@ -31,130 +31,39 @@ jobs:
             --config=p/php \
             --config=p/ruby \
             --config=p/security-audit \
-            --json \
-            --output semgrep.json \
-        env:
-          SEMGREP_RULES: auto
-  
-  # Fail PR if ERROR-level findings exist
-      - name: Fail on ERROR-level findings
-        if: github.event_name == 'pull_request'
+            --sarif -o semgrep.sarif \
+            --json -o semgrep.json
+        continue-on-error: true
+
+      - name: Check for ERROR-level findings
         run: |
-          ERRORS=$(jq '[.results[] | select(.severity=="ERROR")] | length' semgrep.json)
+          ERRORS=$(jq '[.results[] | select(.extra.severity=="ERROR")] | length' semgrep.json)
           echo "ERROR-level findings: $ERRORS"
           if [ "$ERRORS" -gt 0 ]; then
-            echo "::error ::Found $ERRORS ERROR-level findings. Failing PR."
+            echo "::error::Found $ERRORS ERROR-level findings"
             exit 1
           fi
 
-      # Process Semgrep results for aggregated report
-      - name: Process Semgrep Results
-        run: |
-          python3 << 'EOF'
-          import json
-          findings = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}
-          details = []
-          try:
-              with open('semgrep.json', 'r') as f:
-                  data = json.load(f)
-              for r in data.get('results', []):
-                  severity = (r.get('severity') or 'INFO').upper()
-                  if severity == 'ERROR':
-                      findings['high'] += 1
-                      sev_label = 'high'
-                  elif severity == 'WARNING':
-                      findings['medium'] += 1
-                      sev_label = 'medium'
-                  elif severity == 'INFO':
-                      findings['info'] += 1
-                      sev_label = 'info'
-                  else:
-                      findings['low'] += 1
-                      sev_label = 'low'
-                  details.append({
-                      'severity': sev_label,
-                      'rule': r.get('check_id', 'unknown'),
-                      'message': r.get('extra', {}).get('message', 'No description'),
-                      'location': f"{r.get('path', 'unknown')}:{r.get('start', {}).get('line', 0)}"
-                  })
-          except Exception as e:
-              print(f"Error processing Semgrep results: {e}")
-          output = {'summary': findings, 'details': details[:10]}
-          with open('semgrep-summary.json', 'w') as f:
-              json.dump(output, f)
-          EOF
-      
-      # Upload artifact for report job
-      - name: Upload Semgrep Summary
+      - name: Post PR Comments
+        uses: reviewdog/action-sarif@v1
+        if: github.event_name == 'pull_request'
+        with:
+          name: Semgrep
+          sarif_file: semgrep.sarif
+          reporter: github-pr-review
+          level: info
+          fail_on_error: false
+          filter_mode: added
+
+      - name: Upload SARIF
         uses: actions/upload-artifact@v4
         with:
-          name: semgrep-summary
-          path: semgrep-summary.json
+          name: semgrep-sarif
+          path: semgrep.sarif
           retention-days: 1
 
-      - name: Show semgrep.rdjson (debug)
-        run: |
-          echo "PWD: $(pwd)"
-          echo "ls -la:"
-          ls -la
-          echo "preview semgrep.rdjson (first 200 lines):"
-          head -n 200 semgrep.rdjson || true
-
-      - name: Convert Semgrep JSON -> RDJSON
-        run: |
-          python3 .github/scripts/semgrep_to_rdjson.py < semgrep.json > semgrep.rdjson
-          echo "semgrep.rdjson count: $(python3 -c "import json; print(len(json.load(open('semgrep.rdjson'))['diagnostics']))")"
-
-      - name: Debug - show semgrep.rdjson
-        run: |
-          echo "PWD: $(pwd)"
-          ls -la
-          head -n 200 semgrep.rdjson || true
-
-      - name: Install reviewdog CLI
-        run: |
-          curl -sSLo /tmp/install_reviewdog.sh https://raw.githubusercontent.com/reviewdog/reviewdog/master/install.sh
-          bash /tmp/install_reviewdog.sh -b /usr/local/bin
-          reviewdog -version
-
-      - name:
-          Post Semgrep PR review
-        env:
-          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.REVIEWDOG_TOKEN }}   # PAT (repo secret)
-          BASE_REF: ${{ github.base_ref }}
-          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
-        run: |
-          # choose reporter: github-pr-review requires PAT (REVIEWDOG_GITHUB_API_TOKEN)
-          # for PRs from forks the secret is unavailable; we fallback to github-check using GITHUB_TOKEN
-          if [ "${IS_FORK}" = "true" ]; then
-            echo "PR is from a fork: using github-check with GITHUB_TOKEN (no PAT)"
-            export REVIEWDOG_GITHUB_API_TOKEN="${{ secrets.GITHUB_TOKEN }}"
-            cat semgrep.rdjson \
-              | reviewdog -f=rdjson \
-                          -name="semgrep" \
-                          -reporter=github-check \
-                          -level=info \
-                          -filter-mode=nofilter \
-                          -diff="origin/${BASE_REF}" \
-                          -fail-on-error=false || true
-          else
-            echo "Internal PR: using github-pr-review with PAT"
-            # REVIEWDOG_GITHUB_API_TOKEN must be set to the PAT in the repository secret REVIEWDOG_TOKEN
-            cat semgrep.rdjson \
-              | reviewdog -f=rdjson \
-                          -name="semgrep" \
-                          -reporter=github-pr-review \
-                          -level=info \
-                          -filter-mode=nofilter \
-                          -diff="origin/${BASE_REF}" \
-                          -fail-on-error=false || true
-          fi
-  
-  # Other jobs (SQLFluff, TSQLLint, PowerShell, Checkov, Trivy, TruffleHog) remain unchanged
-  # Report job remains unchanged and will now include Semgrep findings from semgrep-summary.json
-  
   sqlfluff:
-    name: SQLFluff Analysis
+    name: SQLFluff
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -163,92 +72,116 @@ jobs:
         id: check_sql
         run: |
           if find . -type f -name "*.sql" | grep -q .; then
-            echo "has_sql_files=true" >> $GITHUB_OUTPUT
+            echo "has_sql=true" >> $GITHUB_OUTPUT
           else
-            echo "has_sql_files=false" >> $GITHUB_OUTPUT
+            echo "has_sql=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Set up Python
-        if: steps.check_sql.outputs.has_sql_files == 'true'
+        if: steps.check_sql.outputs.has_sql == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install SQLFluff
-        if: steps.check_sql.outputs.has_sql_files == 'true'
+        if: steps.check_sql.outputs.has_sql == 'true'
         run: pip install sqlfluff sqlfluff-templater-dbt
 
       - name: Run SQLFluff
-        if: steps.check_sql.outputs.has_sql_files == 'true'
-        run: |
-          sqlfluff lint . --format json --dialect tsql > sqlfluff-results.json || true
+        if: steps.check_sql.outputs.has_sql == 'true'
+        run: sqlfluff lint . --format json --dialect tsql > sqlfluff.json || true
         continue-on-error: true
 
-      - name: Process SQLFluff Results
-        if: steps.check_sql.outputs.has_sql_files == 'true'
+      - name: Convert to SARIF
+        if: steps.check_sql.outputs.has_sql == 'true'
         run: |
           python3 << 'EOF'
           import json
           
-          findings = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}
-          details = []
+          sarif = {
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "SQLFluff",
+                          "version": "1.0.0",
+                          "informationUri": "https://www.sqlfluff.com/"
+                      }
+                  },
+                  "results": []
+              }]
+          }
           
           try:
-              with open('sqlfluff-results.json', 'r') as f:
+              with open('sqlfluff.json', 'r') as f:
                   data = json.load(f)
-          
+              
               for violation in data:
-                  rule_code = violation.get('code', '')
+                  rule_code = violation.get('code', 'unknown')
                   description = violation.get('description', 'No description')
                   filepath = violation.get('filepath', 'unknown')
-                  line = violation.get('line_no', 0)
-          
-                  # SQLFluff doesn't have real severity levels, categorize by rule type
-                  # Layout/style rules (L001-L099) are info level
+                  line = violation.get('line_no', 1)
+                  col = violation.get('line_pos', 1)
+                  
+                  # Map to SARIF levels
                   if rule_code.startswith('L0'):
-                      findings['info'] += 1
-                      sev_label = 'info'
-                  # Convention rules (L1xx-L9xx) are low
+                      level = 'note'
                   elif rule_code.startswith('L'):
-                      findings['low'] += 1
-                      sev_label = 'low'
-                  # Everything else (parsing errors, etc.) is medium
+                      level = 'warning'
                   else:
-                      findings['medium'] += 1
-                      sev_label = 'medium'
-          
-                  details.append({
-                      'severity': sev_label,
-                      'rule': rule_code,
-                      'message': description,
-                      'location': f"{filepath}:{line}"
-                  })
+                      level = 'warning'
+                  
+                  result = {
+                      "ruleId": rule_code,
+                      "level": level,
+                      "message": {"text": description},
+                      "locations": [{
+                          "physicalLocation": {
+                              "artifactLocation": {"uri": filepath},
+                              "region": {"startLine": line, "startColumn": col}
+                          }
+                      }]
+                  }
+                  sarif["runs"][0]["results"].append(result)
           except:
               pass
           
-          output = {
-              'summary': findings,
-              'details': details[:10]
-          }
-          
-          with open('sqlfluff-summary.json', 'w') as f:
-              json.dump(output, f)
+          with open('sqlfluff.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
           EOF
 
-      - name: Create empty summary if no SQL files
-        if: steps.check_sql.outputs.has_sql_files == 'false'
+      - name: Create empty SARIF if no SQL
+        if: steps.check_sql.outputs.has_sql == 'false'
         run: |
-          echo '{"summary": {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}, "details": []}' > sqlfluff-summary.json
+          cat > sqlfluff.sarif << 'EOF'
+          {
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{"tool": {"driver": {"name": "SQLFluff"}}, "results": []}]
+          }
+          EOF
 
-      - name: Upload summary
+      - name: Post PR Comments
+        uses: reviewdog/action-sarif@v1
+        if: github.event_name == 'pull_request' && steps.check_sql.outputs.has_sql == 'true'
+        with:
+          name: SQLFluff
+          sarif_file: sqlfluff.sarif
+          reporter: github-pr-review
+          level: info
+          fail_on_error: false
+          filter_mode: added
+
+      - name: Upload SARIF
         uses: actions/upload-artifact@v4
         with:
-          name: sqlfluff-summary
-          path: sqlfluff-summary.json
+          name: sqlfluff-sarif
+          path: sqlfluff.sarif
           retention-days: 1
-  
+
   tsqllint:
-    name: TSQLLint Analysis
+    name: TSQLLint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -257,91 +190,107 @@ jobs:
         id: check_sql
         run: |
           if find . -type f -name "*.sql" | grep -q .; then
-            echo "has_sql_files=true" >> $GITHUB_OUTPUT
+            echo "has_sql=true" >> $GITHUB_OUTPUT
           else
-            echo "has_sql_files=false" >> $GITHUB_OUTPUT
+            echo "has_sql=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Setup .NET
-        if: steps.check_sql.outputs.has_sql_files == 'true'
+        if: steps.check_sql.outputs.has_sql == 'true'
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
 
       - name: Install TSQLLint
-        if: steps.check_sql.outputs.has_sql_files == 'true'
+        if: steps.check_sql.outputs.has_sql == 'true'
         run: dotnet tool install --global TSQLLint
 
       - name: Run TSQLLint
-        if: steps.check_sql.outputs.has_sql_files == 'true'
-        run: |
-          ~/.dotnet/tools/tsqllint . > tsqllint-results.txt || true
+        if: steps.check_sql.outputs.has_sql == 'true'
+        run: ~/.dotnet/tools/tsqllint . > tsqllint.txt || true
         continue-on-error: true
 
-      - name: Process TSQLLint Results
-        if: steps.check_sql.outputs.has_sql_files == 'true'
+      - name: Convert to SARIF
+        if: steps.check_sql.outputs.has_sql == 'true'
         run: |
           python3 << 'EOF'
-          import re
           import json
+          import re
           
-          findings = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}
-          details = []
+          sarif = {
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "TSQLLint",
+                          "version": "1.0.0"
+                      }
+                  },
+                  "results": []
+              }]
+          }
           
           try:
-              with open('tsqllint-results.txt', 'r') as f:
+              with open('tsqllint.txt', 'r') as f:
                   lines = f.readlines()
-          
-              # TSQLLint format: filepath(line,col) : error/warning/information code : message
-              pattern = r'(.+?)\((\d+),\d+\)\s*:\s*(error|warning|information)\s+(\S+)\s*:\s*(.+)'
-          
+              
+              pattern = r'(.+?)\((\d+),(\d+)\)\s*:\s*(error|warning|information)\s+(\S+)\s*:\s*(.+)'
+              
               for line in lines:
                   match = re.match(pattern, line, re.IGNORECASE)
                   if match:
-                      filepath, line_num, level, code, message = match.groups()
-          
-                      level_lower = level.lower()
-                      if level_lower == 'error':
-                          findings['high'] += 1
-                          sev_label = 'high'
-                      elif level_lower == 'warning':
-                          findings['medium'] += 1
-                          sev_label = 'medium'
-                      elif level_lower == 'information':
-                          findings['info'] += 1
-                          sev_label = 'info'
-                      else:
-                          findings['low'] += 1
-                          sev_label = 'low'
-          
-                      details.append({
-                          'severity': sev_label,
-                          'rule': code,
-                          'message': message.strip(),
-                          'location': f"{filepath}:{line_num}"
-                      })
+                      filepath, line_num, col_num, level, code, message = match.groups()
+                      
+                      level_map = {'error': 'error', 'warning': 'warning', 'information': 'note'}
+                      sarif_level = level_map.get(level.lower(), 'warning')
+                      
+                      result = {
+                          "ruleId": code,
+                          "level": sarif_level,
+                          "message": {"text": message.strip()},
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {"uri": filepath},
+                                  "region": {"startLine": int(line_num), "startColumn": int(col_num)}
+                              }
+                          }]
+                      }
+                      sarif["runs"][0]["results"].append(result)
           except:
               pass
           
-          output = {
-              'summary': findings,
-              'details': details[:10]
-          }
-          
-          with open('tsqllint-summary.json', 'w') as f:
-              json.dump(output, f)
+          with open('tsqllint.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
           EOF
 
-      - name: Create empty summary if no SQL files
-        if: steps.check_sql.outputs.has_sql_files == 'false'
+      - name: Create empty SARIF if no SQL
+        if: steps.check_sql.outputs.has_sql == 'false'
         run: |
-          echo '{"summary": {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}, "details": []}' > tsqllint-summary.json
+          cat > tsqllint.sarif << 'EOF'
+          {
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{"tool": {"driver": {"name": "TSQLLint"}}, "results": []}]
+          }
+          EOF
 
-      - name: Upload summary
+      - name: Post PR Comments
+        uses: reviewdog/action-sarif@v1
+        if: github.event_name == 'pull_request' && steps.check_sql.outputs.has_sql == 'true'
+        with:
+          name: TSQLLint
+          sarif_file: tsqllint.sarif
+          reporter: github-pr-review
+          level: info
+          fail_on_error: false
+          filter_mode: added
+
+      - name: Upload SARIF
         uses: actions/upload-artifact@v4
         with:
-          name: tsqllint-summary
-          path: tsqllint-summary.json
+          name: tsqllint-sarif
+          path: tsqllint.sarif
           retention-days: 1
 
   powershell:
@@ -356,179 +305,111 @@ jobs:
         run: |
           $psFiles = Get-ChildItem -Path . -Recurse -Include *.ps1,*.psm1,*.psd1 -ErrorAction SilentlyContinue
           if ($psFiles) {
-            echo "has_ps_files=true" >> $env:GITHUB_OUTPUT
+            echo "has_ps=true" >> $env:GITHUB_OUTPUT
           } else {
-            echo "has_ps_files=false" >> $env:GITHUB_OUTPUT
+            echo "has_ps=false" >> $env:GITHUB_OUTPUT
           }
 
       - name: Run PSScriptAnalyzer
-        if: steps.check_ps.outputs.has_ps_files == 'true'
+        if: steps.check_ps.outputs.has_ps == 'true'
         shell: pwsh
         run: |
           Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
           $results = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error,Warning,Information
           
-          $findings = @{
-            critical = 0
-            high = 0
-            medium = 0
-            low = 0
-            info = 0
+          # Build SARIF
+          $sarif = @{
+            '$schema' = 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json'
+            version = '2.1.0'
+            runs = @(@{
+              tool = @{
+                driver = @{
+                  name = 'PSScriptAnalyzer'
+                  version = '1.0.0'
+                }
+              }
+              results = @()
+            })
           }
-          
-          $details = @()
           
           foreach ($result in $results) {
-            $sevLabel = switch ($result.Severity) {
-              'Error' { $findings.high++; 'high' }
-              'Warning' { $findings.medium++; 'medium' }
-              'Information' { $findings.info++; 'info' }
-              default { $findings.low++; 'low' }
+            $level = switch ($result.Severity) {
+              'Error' { 'error' }
+              'Warning' { 'warning' }
+              'Information' { 'note' }
+              default { 'note' }
             }
-          
-            $details += @{
-              severity = $sevLabel
-              rule = $result.RuleName
-              message = $result.Message
-              location = "$($result.ScriptPath):$($result.Line)"
+            
+            $sarif.runs[0].results += @{
+              ruleId = $result.RuleName
+              level = $level
+              message = @{ text = $result.Message }
+              locations = @(@{
+                physicalLocation = @{
+                  artifactLocation = @{ uri = $result.ScriptPath }
+                  region = @{ startLine = $result.Line }
+                }
+              })
             }
           }
           
-          $output = @{
-            summary = $findings
-            details = $details | Select-Object -First 10
-          }
-          
-          $output | ConvertTo-Json -Depth 3 | Out-File -FilePath powershell-summary.json
+          $sarif | ConvertTo-Json -Depth 10 | Out-File -FilePath powershell.sarif
 
-      - name: Create empty summary if no PS files
-        if: steps.check_ps.outputs.has_ps_files == 'false'
+      - name: Create empty SARIF if no PS files
+        if: steps.check_ps.outputs.has_ps == 'false'
         shell: pwsh
         run: |
           @{
-            summary = @{
-              critical = 0
-              high = 0
-              medium = 0
-              low = 0
-              info = 0
-            }
-            details = @()
-          } | ConvertTo-Json | Out-File -FilePath powershell-summary.json
+            '$schema' = 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json'
+            version = '2.1.0'
+            runs = @(@{
+              tool = @{ driver = @{ name = 'PSScriptAnalyzer' } }
+              results = @()
+            })
+          } | ConvertTo-Json -Depth 5 | Out-File -FilePath powershell.sarif
 
-      - name: Upload summary
+      - name: Upload SARIF
         uses: actions/upload-artifact@v4
         with:
-          name: powershell-summary
-          path: powershell-summary.json
+          name: powershell-sarif
+          path: powershell.sarif
           retention-days: 1
 
   checkov:
-    name: Checkov IaC Scan
+    name: Checkov IaC
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check for IaC files
-        id: check_iac
-        run: |
-          if find . -type f \( -name "*.tf" -o -name "Dockerfile" -o -name "*.yaml" -o -name "*.yml" \) | grep -q .; then
-            echo "has_iac_files=true" >> $GITHUB_OUTPUT
-          else
-            echo "has_iac_files=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Set up Python
-        if: steps.check_iac.outputs.has_iac_files == 'true'
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install Checkov
-        if: steps.check_iac.outputs.has_iac_files == 'true'
-        run: pip install checkov
-
       - name: Run Checkov
-        if: steps.check_iac.outputs.has_iac_files == 'true'
-        run: |
-          checkov -d . --output json --output-file-path . --quiet || true
-        continue-on-error: true
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: all
+          output_format: sarif
+          output_file_path: ./
+          soft_fail: true
 
-      - name: Process Checkov Results
-        if: steps.check_iac.outputs.has_iac_files == 'true'
-        run: |
-          python3 << 'EOF'
-          import json
-          import os
-          
-          findings = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}
-          details = []
-          
-          try:
-              # Checkov creates results_json.json
-              with open('results_json.json', 'r') as f:
-                  data = json.load(f)
-          
-              # Process failed checks
-              for result in data.get('results', {}).get('failed_checks', []):
-                  check_id = result.get('check_id', 'unknown')
-                  check_name = result.get('check_name', 'No description')
-                  file_path = result.get('file_path', 'unknown')
-                  file_line = result.get('file_line_range', [0])[0]
-                  guideline = result.get('guideline', '')
-          
-                  # Checkov severity mapping with INFO support
-                  severity_map = {
-                      'CRITICAL': 'critical',
-                      'HIGH': 'high',
-                      'MEDIUM': 'medium',
-                      'LOW': 'low',
-                      'INFO': 'info',
-                      'INFORMATIONAL': 'info'
-                  }
-          
-                  # Get severity or default to low
-                  severity = severity_map.get(result.get('severity', 'LOW').upper(), 'low')
-                  findings[severity] += 1
-          
-                  details.append({
-                      'severity': severity,
-                      'rule': check_id,
-                      'message': check_name,
-                      'guideline': guideline,
-                      'location': f"{file_path}:{file_line}"
-                  })
-          except Exception as e:
-              print(f"Error processing Checkov results: {e}")
-              pass
-          
-          # Sort by severity and limit to top 10
-          severity_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4}
-          details.sort(key=lambda x: severity_order.get(x['severity'], 5))
-          
-          output = {
-              'summary': findings,
-              'details': details[:10]
-          }
-          
-          with open('checkov-summary.json', 'w') as f:
-              json.dump(output, f)
-          EOF
+      - name: Post PR Comments
+        uses: reviewdog/action-sarif@v1
+        if: github.event_name == 'pull_request'
+        with:
+          name: Checkov
+          sarif_file: results.sarif
+          reporter: github-pr-review
+          level: info
+          fail_on_error: false
+          filter_mode: added
 
-      - name: Create empty summary if no IaC files
-        if: steps.check_iac.outputs.has_iac_files == 'false'
-        run: |
-          echo '{"summary": {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}, "details": []}' > checkov-summary.json
-
-      - name: Upload summary
+      - name: Upload SARIF
         uses: actions/upload-artifact@v4
         with:
-          name: checkov-summary
-          path: checkov-summary.json
+          name: checkov-sarif
+          path: results.sarif
           retention-days: 1
 
   trivy:
-    name: Trivy FS Scan (deps + secrets + config)
+    name: Trivy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -539,99 +420,30 @@ jobs:
           scan-type: 'fs'
           scan-ref: '.'
           scanners: 'vuln,secret,config'
-          vuln-type: 'library'     # focus on app/library deps
-          ignore-unfixed: true     # optional, reduces noise
-          format: 'json'
-          output: 'trivy-results.json'
-        continue-on-error: true     # keep pipeline from hard failing for now    
-      
-      - name: Process Results
-        run: |
-          python3 << 'EOF'
-          import json
-          
-          findings = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}
-          details = []
-          
-          try:
-              with open('trivy-results.json', 'r') as f:
-                  data = json.load(f)
-          
-              for result in data.get('Results', []):
-                  target = result.get('Target', 'unknown')
-          
-                  # Process vulnerabilities
-                  for vuln in result.get('Vulnerabilities', []):
-                      severity = vuln.get('Severity', '').lower()
-          
-                      # Handle unknown severities
-                      if severity not in findings:
-                          severity = 'info'
-          
-                      findings[severity] += 1
-          
-                      vuln_id = vuln.get('VulnerabilityID', 'unknown')
-                      pkg_name = vuln.get('PkgName', 'unknown')
-                      installed_version = vuln.get('InstalledVersion', 'unknown')
-                      fixed_version = vuln.get('FixedVersion', 'not available')
-                      title = vuln.get('Title', 'No description')
-          
-                      details.append({
-                          'severity': severity,
-                          'type': 'vulnerability',
-                          'id': vuln_id,
-                          'message': f"{pkg_name} {installed_version}: {title}",
-                          'fix': f"Upgrade to {fixed_version}" if fixed_version != 'not available' else 'No fix available',
-                          'location': target
-                      })
-          
-                  # Process misconfigurations
-                  for misconfig in result.get('Misconfigurations', []):
-                      severity = misconfig.get('Severity', '').lower()
-          
-                      # Handle unknown severities
-                      if severity not in findings:
-                          severity = 'info'
-          
-                      findings[severity] += 1
-          
-                      rule_id = misconfig.get('ID', 'unknown')
-                      title = misconfig.get('Title', 'No description')
-                      message = misconfig.get('Message', '')
-          
-                      details.append({
-                          'severity': severity,
-                          'type': 'misconfiguration',
-                          'id': rule_id,
-                          'message': title,
-                          'fix': message,
-                          'location': target
-                      })
-          except:
-              pass
-          
-          # Sort by severity (critical first) and limit to top 10
-          severity_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4}
-          details.sort(key=lambda x: severity_order.get(x['severity'], 5))
-          
-          output = {
-              'summary': findings,
-              'details': details[:10]
-          }
-          
-          with open('trivy-summary.json', 'w') as f:
-              json.dump(output, f)
-          EOF
+          format: 'sarif'
+          output: 'trivy.sarif'
+        continue-on-error: true
 
-      - name: Upload summary
+      - name: Post PR Comments
+        uses: reviewdog/action-sarif@v1
+        if: github.event_name == 'pull_request'
+        with:
+          name: Trivy
+          sarif_file: trivy.sarif
+          reporter: github-pr-review
+          level: info
+          fail_on_error: false
+          filter_mode: added
+
+      - name: Upload SARIF
         uses: actions/upload-artifact@v4
         with:
-          name: trivy-summary
-          path: trivy-summary.json
+          name: trivy-sarif
+          path: trivy.sarif
           retention-days: 1
 
   trufflehog:
-    name: TruffleHog Secrets
+    name: TruffleHog
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -639,145 +451,154 @@ jobs:
           fetch-depth: 0
 
       - name: Run TruffleHog
-        uses: trufflesecurity/trufflehog@main
-        with:
-          extra_args: --json --only-verified
+        run: |
+          docker run --rm -v "$PWD:/pwd" trufflesecurity/trufflehog:latest \
+            filesystem /pwd \
+            --json \
+            --only-verified > trufflehog.json || true
         continue-on-error: true
 
-      - name: Process Results
+      - name: Convert to SARIF
         run: |
           python3 << 'EOF'
           import json
           
-          findings = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}
-          details = []
-          
-          # TruffleHog outputs are difficult to capture from the action
-          # This is a placeholder structure
-          
-          output = {
-              'summary': findings,
-              'details': details
+          sarif = {
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "TruffleHog",
+                          "version": "3.0.0"
+                      }
+                  },
+                  "results": []
+              }]
           }
           
-          with open('trufflehog-summary.json', 'w') as f:
-              json.dump(output, f)
+          try:
+              with open('trufflehog.json', 'r') as f:
+                  for line in f:
+                      try:
+                          finding = json.loads(line.strip())
+                          
+                          result = {
+                              "ruleId": finding.get('DetectorName', 'secret-detected'),
+                              "level": "error",
+                              "message": {"text": f"Secret detected: {finding.get('DetectorName', 'unknown')}"},
+                              "locations": [{
+                                  "physicalLocation": {
+                                      "artifactLocation": {"uri": finding.get('SourceMetadata', {}).get('Data', {}).get('Filesystem', {}).get('file', 'unknown')},
+                                      "region": {"startLine": 1}
+                                  }
+                              }]
+                          }
+                          sarif["runs"][0]["results"].append(result)
+                      except:
+                          continue
+          except:
+              pass
+          
+          with open('trufflehog.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
           EOF
 
-      - name: Upload summary
+      - name: Upload SARIF
         uses: actions/upload-artifact@v4
         with:
-          name: trufflehog-summary
-          path: trufflehog-summary.json
+          name: trufflehog-sarif
+          path: trufflehog.sarif
           retention-days: 1
 
   report:
-    name: Post Results
+    name: Aggregate Report
     runs-on: ubuntu-latest
     needs: [semgrep, sqlfluff, tsqllint, powershell, checkov, trivy, trufflehog]
     if: always() && github.event_name == 'pull_request'
     steps:
-      - name: Download all artifacts
+      - name: Download all SARIF files
         uses: actions/download-artifact@v4
+        with:
+          pattern: '*-sarif'
 
-      - name: Generate Report
+      - name: Generate Summary
         run: |
           python3 << 'EOF'
           import json
+          import glob
+          import os
           
-          def load_results(filename):
+          def parse_sarif(filepath):
               try:
-                  with open(filename, 'r') as f:
-                      data = json.load(f)
-                      # Handle both old format (dict) and new format (dict with summary/details)
-                      if 'summary' in data:
-                          return data
-                      else:
-                          return {'summary': data, 'details': []}
+                  with open(filepath, 'r') as f:
+                      sarif = json.load(f)
               except:
-                  return {'summary': {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}, 'details': []}
+                  return None, {'error': 0, 'warning': 0, 'note': 0}
+              
+              counts = {'error': 0, 'warning': 0, 'note': 0}
+              tool_name = 'Unknown'
+              
+              for run in sarif.get('runs', []):
+                  tool_name = run.get('tool', {}).get('driver', {}).get('name', 'Unknown')
+                  
+                  for result in run.get('results', []):
+                      level = result.get('level', 'warning')
+                      if level in counts:
+                          counts[level] += 1
+              
+              return tool_name, counts
           
-          semgrep = load_results('semgrep-summary/semgrep-summary.json')
-          sqlfluff = load_results('sqlfluff-summary/sqlfluff-summary.json')
-          tsqllint = load_results('tsqllint-summary/tsqllint-summary.json')
-          powershell = load_results('powershell-summary/powershell-summary.json')
-          checkov = load_results('checkov-summary/checkov-summary.json')
-          trivy = load_results('trivy-summary/trivy-summary.json')
-          trufflehog = load_results('trufflehog-summary/trufflehog-summary.json')
+          # Find all SARIF files
+          sarif_files = []
+          for root, dirs, files in os.walk('.'):
+              for file in files:
+                  if file.endswith('.sarif'):
+                      sarif_files.append(os.path.join(root, file))
           
-          def severity_badge(count, severity):
-              if count == 0:
-                  return f"![{severity}](https://img.shields.io/badge/{severity}-0-success)"
-              colors = {
-                  'critical': 'critical',
-                  'high': 'important',
-                  'medium': 'yellow',
-                  'low': 'blue',
-                  'info': 'lightgrey'
-              }
-              return f"![{severity}](https://img.shields.io/badge/{severity}-{count}-{colors[severity]})"
+          results = {}
+          for filepath in sarif_files:
+              tool_name, counts = parse_sarif(filepath)
+              if tool_name and tool_name != 'Unknown':
+                  results[tool_name] = counts
           
-          def has_findings(data):
-              return sum(data['summary'].values()) > 0
+          # Generate markdown table
+          summary = "## 🔒 Security Scan Summary\n\n"
           
-          report = "## Security Scan Results\n\n"
-          report += "| Tool | Critical | High | Medium | Low | Info |\n"
-          report += "|------|----------|------|--------|-----|------|\n"
+          if results:
+              summary += "| Tool | 🔴 High | 🟠 Medium | 🔵 Low | Total |\n"
+              summary += "|------|---------|-----------|--------|-------|\n"
+              
+              grand_total = {'error': 0, 'warning': 0, 'note': 0}
+              
+              for tool in sorted(results.keys()):
+                  counts = results[tool]
+                  total = sum(counts.values())
+                  summary += f"| {tool} | {counts['error']} | {counts['warning']} | {counts['note']} | **{total}** |\n"
+                  
+                  for level in grand_total:
+                      grand_total[level] += counts[level]
+              
+              total_findings = sum(grand_total.values())
+              summary += f"| **Total** | **{grand_total['error']}** | **{grand_total['warning']}** | **{grand_total['note']}** | **{total_findings}** |\n\n"
+              
+              if grand_total['error'] > 0:
+                  summary += "🔴 **Action Required**: High severity findings detected\n"
+              elif grand_total['warning'] > 0:
+                  summary += "🟠 **Review Recommended**: Medium severity findings detected\n"
+              else:
+                  summary += "✅ **No critical issues found**\n"
+          else:
+              summary += "No security findings detected.\n"
           
-          tools = [
-              ('Semgrep SAST', semgrep),
-              ('SQLFluff', sqlfluff),
-              ('TSQLLint', tsqllint),
-              ('PowerShell', powershell),
-              ('Checkov IaC', checkov),
-              ('Trivy SCA', trivy),
-              ('TruffleHog Secrets', trufflehog)
-          ]
+          with open('security-summary.md', 'w') as f:
+              f.write(summary)
           
-          for name, data in tools:
-              summary = data['summary']
-              report += f"| {name} | "
-              report += " | ".join([severity_badge(summary[s], s) for s in ['critical', 'high', 'medium', 'low', 'info']])
-              report += " |\n"
+          # Also write to GitHub Step Summary
+          with open(os.environ.get('GITHUB_STEP_SUMMARY', '/dev/null'), 'a') as f:
+              f.write(summary)
           
-          total = {s: sum(tool[1]['summary'][s] for tool in tools) for s in ['critical', 'high', 'medium', 'low', 'info']}
-          report += f"| **Total** | "
-          report += " | ".join([severity_badge(total[s], s) for s in ['critical', 'high', 'medium', 'low', 'info']])
-          report += " |\n"
-          
-          # Add detailed findings for each tool
-          for name, data in tools:
-              if has_findings(data) and data['details']:
-                  report += f"\n### {name} - Top Findings\n"
-          
-                  for detail in data['details']:
-                      severity_emoji = {
-                          'critical': '🔴',
-                          'high': '🟠',
-                          'medium': '🟡',
-                          'low': '🔵',
-                          'info': '⚪'
-                      }
-                      emoji = severity_emoji.get(detail['severity'], '⚪')
-          
-                      if detail.get('type') in ('vulnerability','misconfiguration'):  # Trivy format
-                          report += f"- {emoji} **{detail['id']}** ({detail['type']}): {detail['message']}\n"
-                          report += f"  - Location: `{detail['location']}`\n"
-                          if detail.get('fix'):
-                              report += f"  - Fix: {detail['fix']}\n"
-                      elif 'guideline' in detail:  # Checkov format
-                          report += f"- {emoji} **{detail['rule']}**: {detail['message']}\n"
-                          report += f"  - Location: `{detail['location']}`\n"
-                          if detail.get('guideline'):
-                              report += f"  - Guideline: {detail['guideline']}\n"
-                      else:  # Standard format
-                          report += f"- {emoji} **{detail['rule']}**: {detail['message']}\n"
-                          report += f"  - Location: `{detail['location']}`\n"
-          
-                  report += "\n" 
-          
-          with open('report.md', 'w') as f:
-              f.write(report)
+          print(summary)
           EOF
 
       - name: Comment PR
@@ -785,12 +606,31 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const report = fs.readFileSync('report.md', 'utf8');
+            const summary = fs.readFileSync('security-summary.md', 'utf8');
             
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
+            const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: report
+              issue_number: context.issue.number,
             });
-
+            
+            const botComment = comments.find(comment => 
+              comment.user.type === 'Bot' && 
+              comment.body.includes('Security Scan Summary')
+            );
+            
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: summary
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: summary
+              });
+            }
