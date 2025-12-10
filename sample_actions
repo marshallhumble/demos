@@ -20,9 +20,23 @@ jobs:
 
       # Run Semgrep scan
       - name: Run Semgrep (C# rules)
-        run: semgrep scan --config p/ci --config p/csharp --json --output semgrep.json
-
-      # Fail PR if ERROR-level findings exist
+        run: |
+          semgrep scan \
+            --config=p/golang \
+            --config=p/csharp \
+            --config=p/python \
+            --config=p/java \
+            --config=p/javascript \
+            --config=p/typescript \
+            --config=p/php \
+            --config=p/ruby \
+            --config=p/security-audit \
+            --json \
+            --output semgrep.json \
+        env:
+          SEMGREP_RULES: auto
+  
+  # Fail PR if ERROR-level findings exist
       - name: Fail on ERROR-level findings
         if: github.event_name == 'pull_request'
         run: |
@@ -77,7 +91,7 @@ jobs:
           name: semgrep-summary
           path: semgrep-summary.json
           retention-days: 1
-          
+
       - name: Show semgrep.rdjson (debug)
         run: |
           echo "PWD: $(pwd)"
@@ -137,9 +151,7 @@ jobs:
           fi
   
   # Other jobs (SQLFluff, TSQLLint, PowerShell, Checkov, Trivy, TruffleHog) remain unchanged
-  # ...
   # Report job remains unchanged and will now include Semgrep findings from semgrep-summary.json
-  
   
   sqlfluff:
     name: SQLFluff Analysis
@@ -516,7 +528,7 @@ jobs:
           retention-days: 1
 
   trivy:
-    name: Trivy Container Scan
+    name: Trivy FS Scan (deps + secrets + config)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -526,11 +538,13 @@ jobs:
         with:
           scan-type: 'fs'
           scan-ref: '.'
+          scanners: 'vuln,secret,config'
+          vuln-type: 'library'     # focus on app/library deps
+          ignore-unfixed: true     # optional, reduces noise
           format: 'json'
           output: 'trivy-results.json'
-          scanners: 'vuln,secret,config'
-        continue-on-error: true
-
+        continue-on-error: true     # keep pipeline from hard failing for now    
+      
       - name: Process Results
         run: |
           python3 << 'EOF'
@@ -779,3 +793,4 @@ jobs:
               repo: context.repo.repo,
               body: report
             });
+
