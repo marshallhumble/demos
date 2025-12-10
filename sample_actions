@@ -12,7 +12,6 @@ permissions:
   contents: read
   pull-requests: write
   security-events: write
-  checks: write
 
 jobs:
   semgrep:
@@ -64,17 +63,6 @@ jobs:
             exit 1
           fi
 
-      - name: Post PR Comments
-        uses: reviewdog/action-sarif@v1
-        if: github.event_name == 'pull_request'
-        with:
-          name: Semgrep
-          sarif_file: semgrep.sarif
-          reporter: github-pr-review
-          level: info
-          fail_on_error: false
-          filter_mode: added
-
       - name: Upload SARIF
         uses: actions/upload-artifact@v4
         with:
@@ -121,17 +109,6 @@ jobs:
             "runs": [{"tool": {"driver": {"name": "Gosec"}}, "results": []}]
           }
           EOF
-
-      - name: Post PR Comments
-        uses: reviewdog/action-sarif@v1
-        if: github.event_name == 'pull_request' && steps.check_go.outputs.has_go == 'true'
-        with:
-          name: Gosec
-          sarif_file: gosec.sarif
-          reporter: github-pr-review
-          level: warning
-          fail_on_error: false
-          filter_mode: added
 
       - name: Upload SARIF
         uses: actions/upload-artifact@v4
@@ -182,17 +159,6 @@ jobs:
           }
           EOF
 
-      - name: Post PR Comments
-        uses: reviewdog/action-sarif@v1
-        if: github.event_name == 'pull_request' && steps.check_rails.outputs.has_rails == 'true'
-        with:
-          name: Brakeman
-          sarif_file: brakeman.sarif
-          reporter: github-pr-review
-          level: warning
-          fail_on_error: false
-          filter_mode: added
-
       - name: Upload SARIF
         uses: actions/upload-artifact@v4
         with:
@@ -242,17 +208,6 @@ jobs:
             "runs": [{"tool": {"driver": {"name": "Staticcheck"}}, "results": []}]
           }
           EOF
-
-      - name: Post PR Comments
-        uses: reviewdog/action-sarif@v1
-        if: github.event_name == 'pull_request' && steps.check_go.outputs.has_go == 'true'
-        with:
-          name: Staticcheck
-          sarif_file: staticcheck.sarif
-          reporter: github-pr-review
-          level: info
-          fail_on_error: false
-          filter_mode: added
 
       - name: Upload SARIF
         uses: actions/upload-artifact@v4
@@ -363,17 +318,6 @@ jobs:
           }
           EOF
 
-      - name: Post PR Comments
-        uses: reviewdog/action-sarif@v1
-        if: github.event_name == 'pull_request' && steps.check_sql.outputs.has_sql == 'true'
-        with:
-          name: SQLFluff
-          sarif_file: sqlfluff.sarif
-          reporter: github-pr-review
-          level: info
-          fail_on_error: false
-          filter_mode: added
-
       - name: Upload SARIF
         uses: actions/upload-artifact@v4
         with:
@@ -477,17 +421,6 @@ jobs:
           }
           EOF
 
-      - name: Post PR Comments
-        uses: reviewdog/action-sarif@v1
-        if: github.event_name == 'pull_request' && steps.check_sql.outputs.has_sql == 'true'
-        with:
-          name: TSQLLint
-          sarif_file: tsqllint.sarif
-          reporter: github-pr-review
-          level: info
-          fail_on_error: false
-          filter_mode: added
-
       - name: Upload SARIF
         uses: actions/upload-artifact@v4
         with:
@@ -570,17 +503,6 @@ jobs:
             })
           } | ConvertTo-Json -Depth 5 | Out-File -FilePath powershell.sarif
 
-      - name: Post PR Comments
-        uses: reviewdog/action-sarif@v1
-        if: github.event_name == 'pull_request' && steps.check_ps.outputs.has_ps == 'true'
-        with:
-          name: PSScriptAnalyzer
-          sarif_file: powershell.sarif
-          reporter: github-pr-review
-          level: info
-          fail_on_error: false
-          filter_mode: added
-
       - name: Upload SARIF
         uses: actions/upload-artifact@v4
         with:
@@ -647,17 +569,6 @@ jobs:
           }
           EOF
 
-      - name: Post PR Comments
-        uses: reviewdog/action-sarif@v1
-        if: github.event_name == 'pull_request' && steps.check_iac.outputs.has_iac == 'true'
-        with:
-          name: Checkov
-          sarif_file: checkov.sarif
-          reporter: github-pr-review
-          level: info
-          fail_on_error: false
-          filter_mode: added
-
       - name: Upload SARIF
         uses: actions/upload-artifact@v4
         with:
@@ -681,17 +592,6 @@ jobs:
           format: 'sarif'
           output: 'trivy.sarif'
         continue-on-error: true
-
-      - name: Post PR Comments
-        uses: reviewdog/action-sarif@v1
-        if: github.event_name == 'pull_request'
-        with:
-          name: Trivy
-          sarif_file: trivy.sarif
-          reporter: github-pr-review
-          level: warning
-          fail_on_error: false
-          filter_mode: added
 
       - name: Upload SARIF
         uses: actions/upload-artifact@v4
@@ -900,17 +800,6 @@ jobs:
           }
           EOF
 
-      - name: Post PR Comments
-        uses: reviewdog/action-sarif@v1
-        if: github.event_name == 'pull_request' && steps.check_dotnet.outputs.has_dotnet == 'true'
-        with:
-          name: .NET Vulnerable Packages
-          sarif_file: dotnet-vulnerable.sarif
-          reporter: github-pr-review
-          level: warning
-          fail_on_error: false
-          filter_mode: added
-
       - name: Upload SARIF
         uses: actions/upload-artifact@v4
         with:
@@ -940,10 +829,11 @@ jobs:
                   with open(filepath, 'r') as f:
                       sarif = json.load(f)
               except:
-                  return None, {'error': 0, 'warning': 0, 'note': 0}
+                  return None, {'error': 0, 'warning': 0, 'note': 0}, []
               
               counts = {'error': 0, 'warning': 0, 'note': 0}
               tool_name = 'Unknown'
+              findings = []
               
               for run in sarif.get('runs', []):
                   tool_name = run.get('tool', {}).get('driver', {}).get('name', 'Unknown')
@@ -952,8 +842,34 @@ jobs:
                       level = result.get('level', 'warning')
                       if level in counts:
                           counts[level] += 1
+                      
+                      # Extract location details
+                      rule_id = result.get('ruleId', 'unknown')
+                      message = result.get('message', {}).get('text', 'No description')
+                      
+                      location_info = 'unknown location'
+                      if result.get('locations'):
+                          phys_loc = result['locations'][0].get('physicalLocation', {})
+                          file_path = phys_loc.get('artifactLocation', {}).get('uri', 'unknown')
+                          region = phys_loc.get('region', {})
+                          start_line = region.get('startLine', 0)
+                          start_col = region.get('startColumn', 0)
+                          
+                          if start_line and start_col:
+                              location_info = f"{file_path}:{start_line}:{start_col}"
+                          elif start_line:
+                              location_info = f"{file_path}:{start_line}"
+                          else:
+                              location_info = file_path
+                      
+                      findings.append({
+                          'level': level,
+                          'rule': rule_id,
+                          'message': message,
+                          'location': location_info
+                      })
               
-              return tool_name, counts
+              return tool_name, counts, findings
           
           # Find all SARIF files
           sarif_files = []
@@ -963,10 +879,13 @@ jobs:
                       sarif_files.append(os.path.join(root, file))
           
           results = {}
+          all_findings = {}
+          
           for filepath in sarif_files:
-              tool_name, counts = parse_sarif(filepath)
+              tool_name, counts, findings = parse_sarif(filepath)
               if tool_name and tool_name != 'Unknown':
                   results[tool_name] = counts
+                  all_findings[tool_name] = findings
           
           # Generate markdown table
           summary = "## 🔒 Security Scan Summary\n\n"
@@ -989,11 +908,37 @@ jobs:
               summary += f"| **Total** | **{grand_total['error']}** | **{grand_total['warning']}** | **{grand_total['note']}** | **{total_findings}** |\n\n"
               
               if grand_total['error'] > 0:
-                  summary += "🔴 **Action Required**: High severity findings detected\n"
+                  summary += "🔴 **Action Required**: High severity findings detected\n\n"
               elif grand_total['warning'] > 0:
-                  summary += "🟠 **Review Recommended**: Medium severity findings detected\n"
+                  summary += "🟠 **Review Recommended**: Medium severity findings detected\n\n"
               else:
-                  summary += "✅ **No critical issues found**\n"
+                  summary += "✅ **No critical issues found**\n\n"
+              
+              # Add detailed findings by tool (limit to top 10 per tool for high/error only)
+              summary += "<details>\n<summary>📋 Detailed Findings (Click to expand)</summary>\n\n"
+              
+              for tool in sorted(all_findings.keys()):
+                  findings = all_findings[tool]
+                  
+                  # Filter to high severity only for the detailed view
+                  high_findings = [f for f in findings if f['level'] == 'error']
+                  
+                  if high_findings:
+                      summary += f"\n### {tool}\n\n"
+                      
+                      # Limit to top 10 findings per tool
+                      for finding in high_findings[:10]:
+                          summary += f"- **{finding['rule']}**: {finding['message']}\n"
+                          summary += f"  - 📍 `{finding['location']}`\n"
+                      
+                      if len(high_findings) > 10:
+                          summary += f"\n*...and {len(high_findings) - 10} more high severity findings*\n"
+              
+              summary += "\n</details>\n"
+              
+              # Add link to full results
+              summary += f"\n---\n"
+              summary += f"[View Full Scan Results](${{github.server_url}}/${{github.repository}}/actions/runs/${{github.run_id}})\n"
           else:
               summary += "No security findings detected.\n"
           
