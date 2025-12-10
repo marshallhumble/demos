@@ -50,82 +50,31 @@ jobs:
             --exclude="test/*" \
             --exclude="tests/*" \
             --exclude="__tests__/*" \
-            --json -o semgrep.json || true
+            --sarif -o semgrep.sarif || echo '{"version":"2.1.0","$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json","runs":[{"tool":{"driver":{"name":"Semgrep"}},"results":[]}]}' > semgrep.sarif
         continue-on-error: true
-
-      - name: Convert Semgrep JSON to SARIF
-        if: always()
-        run: |
-          python3 << 'EOF'
-          import json
-          import sys
-          
-          sarif = {
-              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
-              "version": "2.1.0",
-              "runs": [{
-                  "tool": {
-                      "driver": {
-                          "name": "Semgrep",
-                          "informationUri": "https://semgrep.dev"
-                      }
-                  },
-                  "results": []
-              }]
-          }
-          
-          try:
-              with open('semgrep.json', 'r') as f:
-                  semgrep_output = json.load(f)
-              
-              for result in semgrep_output.get('results', []):
-                  # Map Semgrep severity to SARIF level
-                  severity = result.get('extra', {}).get('severity', 'WARNING')
-                  level_map = {
-                      'ERROR': 'error',
-                      'WARNING': 'warning',
-                      'INFO': 'note'
-                  }
-                  sarif_level = level_map.get(severity, 'warning')
-                  
-                  sarif_result = {
-                      "ruleId": result.get('check_id', 'unknown'),
-                      "level": sarif_level,
-                      "message": {
-                          "text": result.get('extra', {}).get('message', 'No description')
-                      },
-                      "locations": [{
-                          "physicalLocation": {
-                              "artifactLocation": {
-                                  "uri": result.get('path', 'unknown')
-                              },
-                              "region": {
-                                  "startLine": result.get('start', {}).get('line', 1),
-                                  "startColumn": result.get('start', {}).get('col', 1)
-                              }
-                          }
-                      }]
-                  }
-                  sarif["runs"][0]["results"].append(sarif_result)
-          except Exception as e:
-              print(f"Error converting Semgrep output: {e}", file=sys.stderr)
-          
-          with open('semgrep.sarif', 'w') as f:
-              json.dump(sarif, f, indent=2)
-          EOF
 
       - name: Check for ERROR-level findings
         if: github.event_name == 'pull_request'
         run: |
-          if [ -f semgrep.json ]; then
-            ERRORS=$(jq '[.results[] | select(.extra.severity=="ERROR")] | length' semgrep.json)
+          if [ -f semgrep.sarif ]; then
+            ERRORS=$(python3 -c "
+          import json
+          with open('semgrep.sarif') as f:
+              sarif = json.load(f)
+          count = 0
+          for run in sarif.get('runs', []):
+              for result in run.get('results', []):
+                  if result.get('level') == 'error':
+                      count += 1
+          print(count)
+          ")
             echo "ERROR-level findings: $ERRORS"
             if [ "$ERRORS" -gt 0 ]; then
               echo "::error::Found $ERRORS ERROR-level findings"
               exit 1
             fi
           else
-            echo "No semgrep.json file found, skipping ERROR check"
+            echo "No semgrep.sarif file found, skipping ERROR check"
           fi
 
       - name: Upload SARIF
