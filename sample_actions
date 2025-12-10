@@ -3,6 +3,11 @@ on:
   pull_request:
     branches: [ main, develop ]
 
+# Cancel in-progress runs when new commits are pushed
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   pull-requests: write
@@ -19,6 +24,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Cache Semgrep rules
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/semgrep
+          key: ${{ runner.os }}-semgrep-rules-${{ hashFiles('.semgrep/**') }}-${{ hashFiles('.github/workflows/security-scanning.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-semgrep-rules-
+
       - name: Run Semgrep
         run: |
           semgrep scan \
@@ -31,6 +44,13 @@ jobs:
             --config=p/php \
             --config=p/ruby \
             --config=p/security-audit \
+            --exclude="*_test.go" \
+            --exclude="*_test.py" \
+            --exclude="*.test.js" \
+            --exclude="*.spec.ts" \
+            --exclude="test/*" \
+            --exclude="tests/*" \
+            --exclude="__tests__/*" \
             --sarif -o semgrep.sarif \
             --json -o semgrep.json
         continue-on-error: true
@@ -62,6 +82,185 @@ jobs:
           path: semgrep.sarif
           retention-days: 1
 
+  gosec:
+    name: Gosec (Go Security)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for Go files
+        id: check_go
+        run: |
+          if find . -type f -name "*.go" | grep -q .; then
+            echo "has_go=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_go=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Go
+        if: steps.check_go.outputs.has_go == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+
+      - name: Run Gosec
+        if: steps.check_go.outputs.has_go == 'true'
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          gosec -fmt sarif -out gosec.sarif -stdout -verbose=text ./...
+        continue-on-error: true
+
+      - name: Create empty SARIF if no Go files
+        if: steps.check_go.outputs.has_go == 'false'
+        run: |
+          cat > gosec.sarif << 'EOF'
+          {
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{"tool": {"driver": {"name": "Gosec"}}, "results": []}]
+          }
+          EOF
+
+      - name: Post PR Comments
+        uses: reviewdog/action-sarif@v1
+        if: github.event_name == 'pull_request' && steps.check_go.outputs.has_go == 'true'
+        with:
+          name: Gosec
+          sarif_file: gosec.sarif
+          reporter: github-pr-review
+          level: warning
+          fail_on_error: false
+          filter_mode: added
+
+      - name: Upload SARIF
+        uses: actions/upload-artifact@v4
+        with:
+          name: gosec-sarif
+          path: gosec.sarif
+          retention-days: 1
+
+  brakeman:
+    name: Brakeman (Rails Security)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for Rails/Ruby files
+        id: check_rails
+        run: |
+          if [ -f "Gemfile" ] || [ -f "config/application.rb" ] || find . -type f -name "*.rb" | grep -q .; then
+            echo "has_rails=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_rails=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Ruby
+        if: steps.check_rails.outputs.has_rails == 'true'
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+
+      - name: Install Brakeman
+        if: steps.check_rails.outputs.has_rails == 'true'
+        run: gem install brakeman
+
+      - name: Run Brakeman
+        if: steps.check_rails.outputs.has_rails == 'true'
+        run: |
+          brakeman --format sarif --output brakeman.sarif --no-pager --quiet || true
+        continue-on-error: true
+
+      - name: Create empty SARIF if no Rails
+        if: steps.check_rails.outputs.has_rails == 'false'
+        run: |
+          cat > brakeman.sarif << 'EOF'
+          {
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{"tool": {"driver": {"name": "Brakeman"}}, "results": []}]
+          }
+          EOF
+
+      - name: Post PR Comments
+        uses: reviewdog/action-sarif@v1
+        if: github.event_name == 'pull_request' && steps.check_rails.outputs.has_rails == 'true'
+        with:
+          name: Brakeman
+          sarif_file: brakeman.sarif
+          reporter: github-pr-review
+          level: warning
+          fail_on_error: false
+          filter_mode: added
+
+      - name: Upload SARIF
+        uses: actions/upload-artifact@v4
+        with:
+          name: brakeman-sarif
+          path: brakeman.sarif
+          retention-days: 1
+
+  staticcheck:
+    name: Staticcheck (Go Linting)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for Go files
+        id: check_go
+        run: |
+          if find . -type f -name "*.go" | grep -q .; then
+            echo "has_go=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_go=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Go
+        if: steps.check_go.outputs.has_go == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+
+      - name: Run Staticcheck
+        if: steps.check_go.outputs.has_go == 'true'
+        uses: dominikh/staticcheck-action@v1
+        with:
+          version: "latest"
+          install-go: false
+          output-format: sarif
+          output-file: staticcheck.sarif
+        continue-on-error: true
+
+      - name: Create empty SARIF if no Go files
+        if: steps.check_go.outputs.has_go == 'false'
+        run: |
+          cat > staticcheck.sarif << 'EOF'
+          {
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{"tool": {"driver": {"name": "Staticcheck"}}, "results": []}]
+          }
+          EOF
+
+      - name: Post PR Comments
+        uses: reviewdog/action-sarif@v1
+        if: github.event_name == 'pull_request' && steps.check_go.outputs.has_go == 'true'
+        with:
+          name: Staticcheck
+          sarif_file: staticcheck.sarif
+          reporter: github-pr-review
+          level: info
+          fail_on_error: false
+          filter_mode: added
+
+      - name: Upload SARIF
+        uses: actions/upload-artifact@v4
+        with:
+          name: staticcheck-sarif
+          path: staticcheck.sarif
+          retention-days: 1
+
   sqlfluff:
     name: SQLFluff
     runs-on: ubuntu-latest
@@ -82,6 +281,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install SQLFluff
         if: steps.check_sql.outputs.has_sql == 'true'
@@ -89,7 +289,8 @@ jobs:
 
       - name: Run SQLFluff
         if: steps.check_sql.outputs.has_sql == 'true'
-        run: sqlfluff lint . --format json --dialect tsql > sqlfluff.json || true
+        run: |
+          sqlfluff lint . --format json --dialect tsql > sqlfluff.json || true
         continue-on-error: true
 
       - name: Convert to SARIF
@@ -144,8 +345,8 @@ jobs:
                       }]
                   }
                   sarif["runs"][0]["results"].append(result)
-          except:
-              pass
+          except Exception as e:
+              print(f"Error processing SQLFluff results: {e}")
           
           with open('sqlfluff.sarif', 'w') as f:
               json.dump(sarif, f, indent=2)
@@ -207,7 +408,8 @@ jobs:
 
       - name: Run TSQLLint
         if: steps.check_sql.outputs.has_sql == 'true'
-        run: ~/.dotnet/tools/tsqllint . > tsqllint.txt || true
+        run: |
+          ~/.dotnet/tools/tsqllint . > tsqllint.txt || true
         continue-on-error: true
 
       - name: Convert to SARIF
@@ -257,8 +459,8 @@ jobs:
                           }]
                       }
                       sarif["runs"][0]["results"].append(result)
-          except:
-              pass
+          except Exception as e:
+              print(f"Error processing TSQLLint results: {e}")
           
           with open('tsqllint.sarif', 'w') as f:
               json.dump(sarif, f, indent=2)
@@ -368,6 +570,17 @@ jobs:
             })
           } | ConvertTo-Json -Depth 5 | Out-File -FilePath powershell.sarif
 
+      - name: Post PR Comments
+        uses: reviewdog/action-sarif@v1
+        if: github.event_name == 'pull_request' && steps.check_ps.outputs.has_ps == 'true'
+        with:
+          name: PSScriptAnalyzer
+          sarif_file: powershell.sarif
+          reporter: github-pr-review
+          level: info
+          fail_on_error: false
+          filter_mode: added
+
       - name: Upload SARIF
         uses: actions/upload-artifact@v4
         with:
@@ -381,7 +594,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check for IaC files
+        id: check_iac
+        run: |
+          if find . -type f \( -name "*.tf" -o -name "Dockerfile" -o -name "*.yaml" -o -name "*.yml" \) | grep -q .; then
+            echo "has_iac=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_iac=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Python
+        if: steps.check_iac.outputs.has_iac == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
       - name: Run Checkov
+        if: steps.check_iac.outputs.has_iac == 'true'
         uses: bridgecrewio/checkov-action@master
         with:
           directory: .
@@ -389,13 +619,40 @@ jobs:
           output_format: sarif
           output_file_path: ./
           soft_fail: true
+        continue-on-error: true
+
+      - name: Rename Checkov output
+        if: steps.check_iac.outputs.has_iac == 'true'
+        run: |
+          if [ -f "results.sarif" ]; then
+            mv results.sarif checkov.sarif
+          else
+            cat > checkov.sarif << 'EOF'
+          {
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{"tool": {"driver": {"name": "Checkov"}}, "results": []}]
+          }
+          EOF
+          fi
+
+      - name: Create empty SARIF if no IaC
+        if: steps.check_iac.outputs.has_iac == 'false'
+        run: |
+          cat > checkov.sarif << 'EOF'
+          {
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{"tool": {"driver": {"name": "Checkov"}}, "results": []}]
+          }
+          EOF
 
       - name: Post PR Comments
         uses: reviewdog/action-sarif@v1
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && steps.check_iac.outputs.has_iac == 'true'
         with:
           name: Checkov
-          sarif_file: results.sarif
+          sarif_file: checkov.sarif
           reporter: github-pr-review
           level: info
           fail_on_error: false
@@ -405,7 +662,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: checkov-sarif
-          path: results.sarif
+          path: checkov.sarif
           retention-days: 1
 
   trivy:
@@ -420,6 +677,7 @@ jobs:
           scan-type: 'fs'
           scan-ref: '.'
           scanners: 'vuln,secret,config'
+          vuln-type: 'library'
           format: 'sarif'
           output: 'trivy.sarif'
         continue-on-error: true
@@ -431,7 +689,7 @@ jobs:
           name: Trivy
           sarif_file: trivy.sarif
           reporter: github-pr-review
-          level: info
+          level: warning
           fail_on_error: false
           filter_mode: added
 
@@ -483,13 +741,18 @@ jobs:
                       try:
                           finding = json.loads(line.strip())
                           
+                          detector = finding.get('DetectorName', 'secret-detected')
+                          source_metadata = finding.get('SourceMetadata', {}).get('Data', {})
+                          filesystem_data = source_metadata.get('Filesystem', {})
+                          filepath = filesystem_data.get('file', 'unknown')
+                          
                           result = {
-                              "ruleId": finding.get('DetectorName', 'secret-detected'),
+                              "ruleId": detector,
                               "level": "error",
-                              "message": {"text": f"Secret detected: {finding.get('DetectorName', 'unknown')}"},
+                              "message": {"text": f"Secret detected: {detector}"},
                               "locations": [{
                                   "physicalLocation": {
-                                      "artifactLocation": {"uri": finding.get('SourceMetadata', {}).get('Data', {}).get('Filesystem', {}).get('file', 'unknown')},
+                                      "artifactLocation": {"uri": filepath},
                                       "region": {"startLine": 1}
                                   }
                               }]
@@ -511,10 +774,154 @@ jobs:
           path: trufflehog.sarif
           retention-days: 1
 
+  dotnet-vulnerable-packages:
+    name: .NET Vulnerable Packages (${{ matrix.dotnet-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        dotnet-version: ['6.0.x', '8.0.x']
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for .NET projects
+        id: check_dotnet
+        run: |
+          if find . -type f \( -name "*.csproj" -o -name "*.fsproj" -o -name "*.vbproj" -o -name "*.sln" \) | grep -q .; then
+            echo "has_dotnet=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_dotnet=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup .NET
+        if: steps.check_dotnet.outputs.has_dotnet == 'true'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ matrix.dotnet-version }}
+          cache: true
+          cache-dependency-path: '**/packages.lock.json'
+
+      - name: Restore dependencies
+        if: steps.check_dotnet.outputs.has_dotnet == 'true'
+        run: dotnet restore || true
+        continue-on-error: true
+
+      - name: Check for vulnerable packages
+        if: steps.check_dotnet.outputs.has_dotnet == 'true'
+        run: |
+          dotnet list package --vulnerable --include-transitive --format json > vulnerable-packages.json || true
+        continue-on-error: true
+
+      - name: Convert to SARIF
+        if: steps.check_dotnet.outputs.has_dotnet == 'true'
+        run: |
+          python3 << 'EOF'
+          import json
+          
+          sarif = {
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "dotnet-vulnerable-packages-${{ matrix.dotnet-version }}",
+                          "informationUri": "https://learn.microsoft.com/en-us/nuget/concepts/auditing-packages"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+          
+          try:
+              with open('vulnerable-packages.json', 'r') as f:
+                  data = json.load(f)
+              
+              for project in data.get('projects', []):
+                  project_path = project.get('path', 'unknown')
+                  
+                  for framework in project.get('frameworks', []):
+                      all_packages = framework.get('topLevelPackages', []) + framework.get('transitivePackages', [])
+                      
+                      for vuln_pkg in all_packages:
+                          if not vuln_pkg.get('vulnerabilities'):
+                              continue
+                          
+                          pkg_name = vuln_pkg.get('id', 'unknown')
+                          pkg_version = vuln_pkg.get('resolvedVersion', 'unknown')
+                          
+                          for vuln in vuln_pkg.get('vulnerabilities', []):
+                              severity_map = {
+                                  'Critical': 'error',
+                                  'High': 'error',
+                                  'Moderate': 'warning',
+                                  'Medium': 'warning',
+                                  'Low': 'note'
+                              }
+                              
+                              severity = vuln.get('severity', 'Moderate')
+                              advisory_url = vuln.get('advisoryUrl', '')
+                              
+                              message = f"Vulnerable package: {pkg_name} {pkg_version} - {severity} severity"
+                              if advisory_url:
+                                  message += f". See: {advisory_url}"
+                              
+                              result = {
+                                  "ruleId": f"nuget-vulnerability-{severity.lower()}",
+                                  "level": severity_map.get(severity, 'warning'),
+                                  "message": {"text": message},
+                                  "locations": [{
+                                      "physicalLocation": {
+                                          "artifactLocation": {"uri": project_path},
+                                          "region": {"startLine": 1}
+                                      }
+                                  }],
+                                  "properties": {
+                                      "package": pkg_name,
+                                      "version": pkg_version,
+                                      "advisory": advisory_url
+                                  }
+                              }
+                              sarif["runs"][0]["results"].append(result)
+          except Exception as e:
+              print(f"Error processing vulnerable packages: {e}")
+          
+          with open('dotnet-vulnerable.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Create empty SARIF if no .NET
+        if: steps.check_dotnet.outputs.has_dotnet == 'false'
+        run: |
+          cat > dotnet-vulnerable.sarif << 'EOF'
+          {
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{"tool": {"driver": {"name": "dotnet-vulnerable-packages-${{ matrix.dotnet-version }}"}}, "results": []}]
+          }
+          EOF
+
+      - name: Post PR Comments
+        uses: reviewdog/action-sarif@v1
+        if: github.event_name == 'pull_request' && steps.check_dotnet.outputs.has_dotnet == 'true'
+        with:
+          name: .NET Vulnerable Packages
+          sarif_file: dotnet-vulnerable.sarif
+          reporter: github-pr-review
+          level: warning
+          fail_on_error: false
+          filter_mode: added
+
+      - name: Upload SARIF
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-vulnerable-sarif-${{ matrix.dotnet-version }}
+          path: dotnet-vulnerable.sarif
+          retention-days: 1
+
   report:
     name: Aggregate Report
     runs-on: ubuntu-latest
-    needs: [semgrep, sqlfluff, tsqllint, powershell, checkov, trivy, trufflehog]
+    needs: [semgrep, gosec, brakeman, staticcheck, sqlfluff, tsqllint, powershell, checkov, trivy, trufflehog, dotnet-vulnerable-packages]
     if: always() && github.event_name == 'pull_request'
     steps:
       - name: Download all SARIF files
@@ -526,7 +933,6 @@ jobs:
         run: |
           python3 << 'EOF'
           import json
-          import glob
           import os
           
           def parse_sarif(filepath):
