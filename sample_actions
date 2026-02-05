@@ -42,7 +42,14 @@ jobs:
             --config=p/typescript \
             --config=p/php \
             --config=p/ruby \
+            --config=p/rust \
+            --config=p/secrets \
+            --config=p/ci \
+            --config=p/owasp-top-ten \
             --config=p/security-audit \
+            --config=p/docker \
+            --config=p/cloudformation \
+            --config=p/supply-chain \
             --exclude="*_test.go" \
             --exclude="*_test.py" \
             --exclude="*.test.js" \
@@ -285,14 +292,14 @@ jobs:
           try:
               with open('sqlfluff.json', 'r') as f:
                   data = json.load(f)
-              
+          
               for violation in data:
                   rule_code = violation.get('code', 'unknown')
                   description = violation.get('description', 'No description')
                   filepath = violation.get('filepath', 'unknown')
                   line = violation.get('line_no', 1)
                   col = violation.get('line_pos', 1)
-                  
+          
                   # Map to SARIF levels
                   if rule_code.startswith('L0'):
                       level = 'note'
@@ -300,7 +307,7 @@ jobs:
                       level = 'warning'
                   else:
                       level = 'warning'
-                  
+          
                   result = {
                       "ruleId": rule_code,
                       "level": level,
@@ -393,17 +400,17 @@ jobs:
           try:
               with open('tsqllint.txt', 'r') as f:
                   lines = f.readlines()
-              
+          
               pattern = r'(.+?)\((\d+),(\d+)\)\s*:\s*(error|warning|information)\s+(\S+)\s*:\s*(.+)'
-              
+          
               for line in lines:
                   match = re.match(pattern, line, re.IGNORECASE)
                   if match:
                       filepath, line_num, col_num, level, code, message = match.groups()
-                      
+          
                       level_map = {'error': 'error', 'warning': 'warning', 'information': 'note'}
                       sarif_level = level_map.get(level.lower(), 'warning')
-                      
+          
                       result = {
                           "ruleId": code,
                           "level": sarif_level,
@@ -487,7 +494,7 @@ jobs:
               'Information' { 'note' }
               default { 'note' }
             }
-            
+          
             $sarif.runs[0].results += @{
               ruleId = $result.RuleName
               level = $level
@@ -646,12 +653,12 @@ jobs:
                   for line in f:
                       try:
                           finding = json.loads(line.strip())
-                          
+          
                           detector = finding.get('DetectorName', 'secret-detected')
                           source_metadata = finding.get('SourceMetadata', {}).get('Data', {})
                           filesystem_data = source_metadata.get('Filesystem', {})
                           filepath = filesystem_data.get('file', 'unknown')
-                          
+          
                           result = {
                               "ruleId": detector,
                               "level": "error",
@@ -739,20 +746,20 @@ jobs:
           try:
               with open('vulnerable-packages.json', 'r') as f:
                   data = json.load(f)
-              
+          
               for project in data.get('projects', []):
                   project_path = project.get('path', 'unknown')
-                  
+          
                   for framework in project.get('frameworks', []):
                       all_packages = framework.get('topLevelPackages', []) + framework.get('transitivePackages', [])
-                      
+          
                       for vuln_pkg in all_packages:
                           if not vuln_pkg.get('vulnerabilities'):
                               continue
-                          
+          
                           pkg_name = vuln_pkg.get('id', 'unknown')
                           pkg_version = vuln_pkg.get('resolvedVersion', 'unknown')
-                          
+          
                           for vuln in vuln_pkg.get('vulnerabilities', []):
                               severity_map = {
                                   'Critical': 'error',
@@ -761,14 +768,14 @@ jobs:
                                   'Medium': 'warning',
                                   'Low': 'note'
                               }
-                              
+          
                               severity = vuln.get('severity', 'Moderate')
                               advisory_url = vuln.get('advisoryUrl', '')
-                              
+          
                               message = f"Vulnerable package: {pkg_name} {pkg_version} - {severity} severity"
                               if advisory_url:
                                   message += f". See: {advisory_url}"
-                              
+          
                               result = {
                                   "ruleId": f"nuget-vulnerability-{severity.lower()}",
                                   "level": severity_map.get(severity, 'warning'),
@@ -834,23 +841,23 @@ jobs:
                       sarif = json.load(f)
               except:
                   return None, {'error': 0, 'warning': 0, 'note': 0}, []
-              
+          
               counts = {'error': 0, 'warning': 0, 'note': 0}
               tool_name = 'Unknown'
               findings = []
-              
+          
               for run in sarif.get('runs', []):
                   tool_name = run.get('tool', {}).get('driver', {}).get('name', 'Unknown')
-                  
+          
                   for result in run.get('results', []):
                       level = result.get('level', 'warning')
                       if level in counts:
                           counts[level] += 1
-                      
+          
                       # Extract location details
                       rule_id = result.get('ruleId', 'unknown')
                       message = result.get('message', {}).get('text', 'No description')
-                      
+          
                       location_info = 'unknown location'
                       if result.get('locations'):
                           phys_loc = result['locations'][0].get('physicalLocation', {})
@@ -858,21 +865,21 @@ jobs:
                           region = phys_loc.get('region', {})
                           start_line = region.get('startLine', 0)
                           start_col = region.get('startColumn', 0)
-                          
+          
                           if start_line and start_col:
                               location_info = f"{file_path}:{start_line}:{start_col}"
                           elif start_line:
                               location_info = f"{file_path}:{start_line}"
                           else:
                               location_info = file_path
-                      
+          
                       findings.append({
                           'level': level,
                           'rule': rule_id,
                           'message': message,
                           'location': location_info
                       })
-              
+          
               return tool_name, counts, findings
           
           # Find all SARIF files
@@ -897,49 +904,49 @@ jobs:
           if results:
               summary += "| Tool | 🔴 High | 🟠 Medium | 🔵 Low | Total |\n"
               summary += "|------|---------|-----------|--------|-------|\n"
-              
+          
               grand_total = {'error': 0, 'warning': 0, 'note': 0}
-              
+          
               for tool in sorted(results.keys()):
                   counts = results[tool]
                   total = sum(counts.values())
                   summary += f"| {tool} | {counts['error']} | {counts['warning']} | {counts['note']} | **{total}** |\n"
-                  
+          
                   for level in grand_total:
                       grand_total[level] += counts[level]
-              
+          
               total_findings = sum(grand_total.values())
               summary += f"| **Total** | **{grand_total['error']}** | **{grand_total['warning']}** | **{grand_total['note']}** | **{total_findings}** |\n\n"
-              
+          
               if grand_total['error'] > 0:
                   summary += "🔴 **Action Required**: High severity findings detected\n\n"
               elif grand_total['warning'] > 0:
                   summary += "🟠 **Review Recommended**: Medium severity findings detected\n\n"
               else:
                   summary += "✅ **No critical issues found**\n\n"
-              
+          
               # Add detailed findings by tool (limit to top 10 per tool for high/error only)
               summary += "<details>\n<summary>📋 Detailed Findings (Click to expand)</summary>\n\n"
-              
+          
               for tool in sorted(all_findings.keys()):
                   findings = all_findings[tool]
-                  
+          
                   # Filter to high severity only for the detailed view
                   high_findings = [f for f in findings if f['level'] == 'error']
-                  
+          
                   if high_findings:
                       summary += f"\n### {tool}\n\n"
-                      
+          
                       # Limit to top 10 findings per tool
                       for finding in high_findings[:10]:
                           summary += f"- **{finding['rule']}**: {finding['message']}\n"
                           summary += f"  - 📍 `{finding['location']}`\n"
-                      
+          
                       if len(high_findings) > 10:
                           summary += f"\n*...and {len(high_findings) - 10} more high severity findings*\n"
-              
+          
               summary += "\n</details>\n"
-              
+          
               # Add link to full results
               summary += f"\n---\n"
               summary += f"[View Full Scan Results](${{github.server_url}}/${{github.repository}}/actions/runs/${{github.run_id}})\n"
@@ -955,37 +962,3 @@ jobs:
           
           print(summary)
           EOF
-
-      - name: Comment PR
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const summary = fs.readFileSync('security-summary.md', 'utf8');
-            
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-            
-            const botComment = comments.find(comment => 
-              comment.user.type === 'Bot' && 
-              comment.body.includes('Security Scan Summary')
-            );
-            
-            if (botComment) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: botComment.id,
-                body: summary
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body: summary
-              });
-            }
