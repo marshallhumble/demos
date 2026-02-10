@@ -328,7 +328,6 @@ jobs:
       - name: Run SQLFluff
         if: steps.changed_sql.outputs.has_sql == 'true'
         run: |
-          # Run with multiple common dialects, let SQLFluff auto-detect or use ansi as fallback
           cat changed_sql_files.txt | xargs sqlfluff lint --format json --dialect ansi > sqlfluff.json || true
         continue-on-error: true
 
@@ -820,8 +819,12 @@ jobs:
           retention-days: 1
 
   dotnet-vulnerable-packages:
-    name: .NET Vulnerable Packages
+    name: .NET Vulnerable Packages (${{ matrix.dotnet-version }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        dotnet-version: ['6.0.x', '8.0.x']
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -849,7 +852,7 @@ jobs:
         if: steps.check_dotnet.outputs.has_dotnet == 'true'
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0.x'
+          dotnet-version: ${{ matrix.dotnet-version }}
 
       - name: Restore dependencies
         if: steps.check_dotnet.outputs.has_dotnet == 'true'
@@ -880,7 +883,7 @@ jobs:
               "runs": [{
                   "tool": {
                       "driver": {
-                          "name": "dotnet-vulnerable-packages",
+                          "name": "dotnet-vulnerable-packages-${{ matrix.dotnet-version }}",
                           "informationUri": "https://learn.microsoft.com/en-us/nuget/concepts/auditing-packages"
                       }
                   },
@@ -952,14 +955,14 @@ jobs:
           {
             "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
             "version": "2.1.0",
-            "runs": [{"tool": {"driver": {"name": "dotnet-vulnerable-packages"}}, "results": []}]
+            "runs": [{"tool": {"driver": {"name": "dotnet-vulnerable-packages-${{ matrix.dotnet-version }}"}}, "results": []}]
           }
           EOF
 
       - name: Upload SARIF
         uses: actions/upload-artifact@v4
         with:
-          name: dotnet-vulnerable-sarif
+          name: dotnet-vulnerable-sarif-${{ matrix.dotnet-version }}
           path: dotnet-vulnerable.sarif
           retention-days: 1
 
@@ -972,7 +975,7 @@ jobs:
       - name: Download all SARIF files
         uses: actions/download-artifact@v4
         with:
-          pattern: '*-sarif'
+          pattern: '*-sarif*'
 
       - name: Set up Python
         uses: actions/setup-python@v5
