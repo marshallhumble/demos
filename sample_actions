@@ -96,14 +96,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Check for Go files
+      - name: Check for changed Go files
         id: check_go
         run: |
-          if find . -type f -name "*.go" | grep -q .; then
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            CHANGED_FILES=$(git diff --name-only --diff-filter=d origin/${{ github.base_ref }}...HEAD | grep -E '\.go$' || echo "")
+          else
+            CHANGED_FILES=$(find . -type f -name "*.go")
+          fi
+          
+          if [ -n "$CHANGED_FILES" ]; then
             echo "has_go=true" >> $GITHUB_OUTPUT
+            echo "Go files changed:"
+            echo "$CHANGED_FILES"
           else
             echo "has_go=false" >> $GITHUB_OUTPUT
+            echo "No Go files changed in this PR"
           fi
 
       - name: Set up Go
@@ -143,14 +154,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Check for Rails/Ruby files
+      - name: Check for changed Rails/Ruby files
         id: check_rails
         run: |
-          if [ -f "Gemfile" ] || [ -f "config/application.rb" ] || find . -type f -name "*.rb" | grep -q .; then
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            CHANGED_FILES=$(git diff --name-only --diff-filter=d origin/${{ github.base_ref }}...HEAD | grep -E '\.(rb)$|Gemfile' || echo "")
+          else
+            CHANGED_FILES=$(find . -type f -name "*.rb" -o -name "Gemfile")
+          fi
+          
+          if [ -n "$CHANGED_FILES" ] || [ -f "Gemfile" ] || [ -f "config/application.rb" ]; then
             echo "has_rails=true" >> $GITHUB_OUTPUT
+            echo "Rails/Ruby files changed or detected"
           else
             echo "has_rails=false" >> $GITHUB_OUTPUT
+            echo "No Rails/Ruby files changed in this PR"
           fi
 
       - name: Set up Ruby
@@ -192,14 +213,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Check for Go files
+      - name: Check for changed Go files
         id: check_go
         run: |
-          if find . -type f -name "*.go" | grep -q .; then
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            CHANGED_FILES=$(git diff --name-only --diff-filter=d origin/${{ github.base_ref }}...HEAD | grep -E '\.go$' || echo "")
+          else
+            CHANGED_FILES=$(find . -type f -name "*.go")
+          fi
+          
+          if [ -n "$CHANGED_FILES" ]; then
             echo "has_go=true" >> $GITHUB_OUTPUT
+            echo "Go files changed:"
+            echo "$CHANGED_FILES"
           else
             echo "has_go=false" >> $GITHUB_OUTPUT
+            echo "No Go files changed in this PR"
           fi
 
       - name: Set up Go
@@ -242,34 +274,46 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Check for SQL files
-        id: check_sql
+      - name: Get changed SQL files
+        id: changed_sql
         run: |
-          if find . -type f -name "*.sql" | grep -q .; then
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            CHANGED_FILES=$(git diff --name-only --diff-filter=d origin/${{ github.base_ref }}...HEAD | grep -E '\.sql$' || echo "")
+          else
+            CHANGED_FILES=$(find . -type f -name "*.sql")
+          fi
+          
+          if [ -n "$CHANGED_FILES" ]; then
             echo "has_sql=true" >> $GITHUB_OUTPUT
+            echo "$CHANGED_FILES" > changed_sql_files.txt
+            echo "SQL files changed:"
+            cat changed_sql_files.txt
           else
             echo "has_sql=false" >> $GITHUB_OUTPUT
+            echo "No SQL files changed in this PR"
           fi
 
       - name: Set up Python
-        if: steps.check_sql.outputs.has_sql == 'true'
+        if: steps.changed_sql.outputs.has_sql == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install SQLFluff
-        if: steps.check_sql.outputs.has_sql == 'true'
+        if: steps.changed_sql.outputs.has_sql == 'true'
         run: pip install sqlfluff sqlfluff-templater-dbt
 
       - name: Run SQLFluff
-        if: steps.check_sql.outputs.has_sql == 'true'
+        if: steps.changed_sql.outputs.has_sql == 'true'
         run: |
-          sqlfluff lint . --format json --dialect tsql > sqlfluff.json || true
+          cat changed_sql_files.txt | xargs sqlfluff lint --format json --dialect tsql > sqlfluff.json || true
         continue-on-error: true
 
       - name: Convert to SARIF
-        if: steps.check_sql.outputs.has_sql == 'true'
+        if: steps.changed_sql.outputs.has_sql == 'true'
         run: |
           python3 << 'EOF'
           import json
@@ -328,7 +372,7 @@ jobs:
           EOF
 
       - name: Create empty SARIF if no SQL
-        if: steps.check_sql.outputs.has_sql == 'false'
+        if: steps.changed_sql.outputs.has_sql == 'false'
         run: |
           cat > sqlfluff.sarif << 'EOF'
           {
@@ -350,34 +394,46 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Check for SQL files
-        id: check_sql
+      - name: Get changed SQL files
+        id: changed_sql
         run: |
-          if find . -type f -name "*.sql" | grep -q .; then
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            CHANGED_FILES=$(git diff --name-only --diff-filter=d origin/${{ github.base_ref }}...HEAD | grep -E '\.sql$' || echo "")
+          else
+            CHANGED_FILES=$(find . -type f -name "*.sql")
+          fi
+          
+          if [ -n "$CHANGED_FILES" ]; then
             echo "has_sql=true" >> $GITHUB_OUTPUT
+            echo "$CHANGED_FILES" > changed_sql_files.txt
+            echo "SQL files changed:"
+            cat changed_sql_files.txt
           else
             echo "has_sql=false" >> $GITHUB_OUTPUT
+            echo "No SQL files changed in this PR"
           fi
 
       - name: Setup .NET
-        if: steps.check_sql.outputs.has_sql == 'true'
+        if: steps.changed_sql.outputs.has_sql == 'true'
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
 
       - name: Install TSQLLint
-        if: steps.check_sql.outputs.has_sql == 'true'
+        if: steps.changed_sql.outputs.has_sql == 'true'
         run: dotnet tool install --global TSQLLint
 
       - name: Run TSQLLint
-        if: steps.check_sql.outputs.has_sql == 'true'
+        if: steps.changed_sql.outputs.has_sql == 'true'
         run: |
-          ~/.dotnet/tools/tsqllint . > tsqllint.txt || true
+          cat changed_sql_files.txt | xargs ~/.dotnet/tools/tsqllint > tsqllint.txt || true
         continue-on-error: true
 
       - name: Convert to SARIF
-        if: steps.check_sql.outputs.has_sql == 'true'
+        if: steps.changed_sql.outputs.has_sql == 'true'
         run: |
           python3 << 'EOF'
           import json
@@ -431,7 +487,7 @@ jobs:
           EOF
 
       - name: Create empty SARIF if no SQL
-        if: steps.check_sql.outputs.has_sql == 'false'
+        if: steps.changed_sql.outputs.has_sql == 'false'
         run: |
           cat > tsqllint.sarif << 'EOF'
           {
@@ -453,16 +509,27 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Check for PowerShell files
+      - name: Check for changed PowerShell files
         id: check_ps
         shell: pwsh
         run: |
-          $psFiles = Get-ChildItem -Path . -Recurse -Include *.ps1,*.psm1,*.psd1 -ErrorAction SilentlyContinue
-          if ($psFiles) {
+          if ($env:GITHUB_EVENT_NAME -eq "pull_request") {
+            $baseBranch = "origin/${{ github.base_ref }}"
+            $changedFiles = git diff --name-only --diff-filter=d $baseBranch...HEAD | Where-Object { $_ -match '\.(ps1|psm1|psd1)$' }
+          } else {
+            $changedFiles = Get-ChildItem -Path . -Recurse -Include *.ps1,*.psm1,*.psd1 -ErrorAction SilentlyContinue
+          }
+          
+          if ($changedFiles) {
             echo "has_ps=true" >> $env:GITHUB_OUTPUT
+            Write-Host "PowerShell files changed:"
+            $changedFiles | ForEach-Object { Write-Host $_ }
           } else {
             echo "has_ps=false" >> $env:GITHUB_OUTPUT
+            Write-Host "No PowerShell files changed in this PR"
           }
 
       - name: Run PSScriptAnalyzer
@@ -535,14 +602,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Check for IaC files
+      - name: Check for changed IaC files
         id: check_iac
         run: |
-          if find . -type f \( -name "*.tf" -o -name "Dockerfile" -o -name "*.yaml" -o -name "*.yml" \) | grep -q .; then
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            CHANGED_FILES=$(git diff --name-only --diff-filter=d origin/${{ github.base_ref }}...HEAD | grep -E '\.(tf|yaml|yml)$|Dockerfile' || echo "")
+          else
+            CHANGED_FILES=$(find . -type f \( -name "*.tf" -o -name "Dockerfile" -o -name "*.yaml" -o -name "*.yml" \))
+          fi
+          
+          if [ -n "$CHANGED_FILES" ]; then
             echo "has_iac=true" >> $GITHUB_OUTPUT
+            echo "IaC files changed:"
+            echo "$CHANGED_FILES"
           else
             echo "has_iac=false" >> $GITHUB_OUTPUT
+            echo "No IaC files changed in this PR"
           fi
 
       - name: Run Checkov
@@ -696,14 +774,25 @@ jobs:
       fail-fast: false
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Check for .NET projects
+      - name: Check for changed .NET files
         id: check_dotnet
         run: |
-          if find . -type f \( -name "*.csproj" -o -name "*.fsproj" -o -name "*.vbproj" -o -name "*.sln" \) | grep -q .; then
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            CHANGED_FILES=$(git diff --name-only --diff-filter=d origin/${{ github.base_ref }}...HEAD | grep -E '\.(csproj|fsproj|vbproj|sln|cs|fs|vb)$' || echo "")
+          else
+            CHANGED_FILES=$(find . -type f \( -name "*.csproj" -o -name "*.fsproj" -o -name "*.vbproj" -o -name "*.sln" \))
+          fi
+          
+          if [ -n "$CHANGED_FILES" ]; then
             echo "has_dotnet=true" >> $GITHUB_OUTPUT
+            echo ".NET files changed:"
+            echo "$CHANGED_FILES"
           else
             echo "has_dotnet=false" >> $GITHUB_OUTPUT
+            echo "No .NET files changed in this PR"
           fi
 
       - name: Setup .NET
@@ -827,7 +916,7 @@ jobs:
       - name: Download all SARIF files
         uses: actions/download-artifact@v4
         with:
-          pattern: '*-sarif'
+          pattern: '*-sarif*'
 
       - name: Generate Summary
         run: |
