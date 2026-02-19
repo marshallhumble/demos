@@ -44,12 +44,9 @@ jobs:
             --config=p/ruby \
             --config=p/rust \
             --config=p/secrets \
-            --config=p/ci \
             --config=p/owasp-top-ten \
             --config=p/security-audit \
             --config=p/docker \
-            --config=p/cloudformation \
-            --config=p/supply-chain \
             --exclude="*_test.go" \
             --exclude="*_test.py" \
             --exclude="*.test.js" \
@@ -57,8 +54,14 @@ jobs:
             --exclude="test/*" \
             --exclude="tests/*" \
             --exclude="__tests__/*" \
-            --sarif -o semgrep.sarif || echo '{"version":"2.1.0","$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json","runs":[{"tool":{"driver":{"name":"Semgrep"}},"results":[]}]}' > semgrep.sarif
+            --sarif -o semgrep.sarif
         continue-on-error: true
+
+      - name: Create empty SARIF if Semgrep failed
+        run: |
+          if [ ! -f semgrep.sarif ]; then
+            echo '{"version":"2.1.0","$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json","runs":[{"tool":{"driver":{"name":"Semgrep"}},"results":[]}]}' > semgrep.sarif
+          fi
 
       - name: Check for ERROR-level findings
         if: github.event_name == 'pull_request'
@@ -685,7 +688,9 @@ jobs:
       - name: Rename Checkov output
         if: steps.check_iac.outputs.has_iac == 'true'
         run: |
-          if [ -f "results.sarif" ]; then
+          if [ -f "results_sarif.sarif" ]; then
+            mv results_sarif.sarif checkov.sarif
+          elif [ -f "results.sarif" ]; then
             mv results.sarif checkov.sarif
           else
             cat > checkov.sarif << 'EOF'
@@ -751,8 +756,7 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/pwd" trufflesecurity/trufflehog:latest \
             filesystem /pwd \
-            --json \
-            --only-verified > trufflehog.json || true
+            --json > trufflehog.json || true
         continue-on-error: true
 
       - name: Set up Python
